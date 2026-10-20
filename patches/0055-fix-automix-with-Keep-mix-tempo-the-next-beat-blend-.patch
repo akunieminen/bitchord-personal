@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 17:20:25 +0300
+Subject: [PATCH 55/61] fix(automix): with Keep mix tempo, the next beat blend
+ matches the tempo the outgoing track is really playing at, not its nominal
+ BPM (beats drifted apart by the kept stretch)
+
+---
+ .../com/music/bitchord/playback/CrossfadeController.kt     | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
+index 44c87f8..f322c19 100644
+--- a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
++++ b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
+@@ -1283,7 +1283,12 @@ class CrossfadeController(
+         // Stacks on top of the listener's speed control rather than replacing
+         // it, so a beatmatched transition and "play everything at 1.25x" don't
+         // fight each other. Undone in [finish].
+-        into.setPlaybackSpeed((AppSettings.playbackSpeed.value * incomingPlaybackRate).toFloat())
++        // Fork (keepMixTempo): the outgoing may still run at the last blend's stretch, and a beat
++        // blend has to match what it plays, not its nominal tempo. Capped, so a run of blends
++        // can't keep speeding up; a filter or plain blend starts at its own speed and drops it.
++        val normal = AppSettings.playbackSpeed.value
++        val kept = if (renderStyle.style == TransitionStyle.DJ_BLEND && normal > 0f) out.playbackParameters.speed / normal else 1f
++        into.setPlaybackSpeed((normal * (incomingPlaybackRate * kept).coerceAtMost(MAX_TOTAL_SPEED_UP)).toFloat())
+         into.volume = 0f
+         val setNanos0 = SystemClock.elapsedRealtimeNanos()
+         into.setMediaItems(items, nextIndex, incomingCueTimeMs)

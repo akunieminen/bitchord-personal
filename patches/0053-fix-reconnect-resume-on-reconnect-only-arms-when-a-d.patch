@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 17:19:23 +0300
+Subject: [PATCH 53/61] fix(reconnect): resume-on-reconnect only arms when a
+ disconnect paused playing music, not when the speaker goes off after the
+ listener paused (it then started music they had stopped)
+
+---
+ .../com/music/bitchord/playback/PlaybackService.kt   | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index b7e4afc..b3396cc 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -874,6 +874,9 @@ class PlaybackService : MediaLibraryService() {
+      * time: the one [player] names.
+      */
+     private val playbackListener = object : Player.Listener {
++        /** Fork: for resume-on-reconnect; the listener moves players, playWhenReady goes with it. */
++        private var lastPlayWhenReady = false
++
+         override fun onEvents(player: Player, events: Player.Events) {
+             val activePlayer = this@PlaybackService.player ?: return
+             if (player === activePlayer) updateAudioEffectSession(activePlayer)
+@@ -972,12 +975,17 @@ class PlaybackService : MediaLibraryService() {
+          * on the audio, which is what the media notification shows too.
+          */
+         override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+-            // Fork: remembered for resume-on-reconnect; any other change forgets it.
+-            noisyPausedAt = if (!playWhenReady && reason == Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_BECOMING_NOISY) {
++            // Fork: remembered for resume-on-reconnect; any other change forgets it. Only a real
++            // playing-to-paused change: a paused player keeps focus, so a speaker switched off
++            // after the listener paused still sends "noisy", and Media3 reports the reason change.
++            noisyPausedAt = if (lastPlayWhenReady && !playWhenReady &&
++                reason == Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_BECOMING_NOISY
++            ) {
+                 SystemClock.elapsedRealtime()
+             } else {
+                 0L
+             }
++            lastPlayWhenReady = playWhenReady
+             // Something started the phone's own player while a receiver is the
+             // speaker — an internal path, since the session player's door
+             // already sends a listener's play to the receiver. The phone goes

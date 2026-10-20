@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 17:18:54 +0300
+Subject: [PATCH 51/61] fix(upgrade): alignment checks the playing copy has a
+ head to measure against before pulling 3 MB of the upgrade's
+
+---
+ .../com/music/bitchord/playback/PlaybackService.kt   | 12 +++++-------
+ 1 file changed, 5 insertions(+), 7 deletions(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index 0ea01a3..4504fa8 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -4702,15 +4702,13 @@ class PlaybackService : MediaLibraryService() {
+      */
+     private suspend fun measureUpgradeOffset(mediaId: String, playingUri: Uri, upgradedUri: String): Long? {
+         val upgraded = Uri.parse(upgradedUri)
++        // Nothing to measure against (a resume or start mid-track has no head on disk): no 3 MB pull.
++        val source = AudioCache.renditionAt(playingUri)
++            ?.takeIf { it.cachedPrefix >= AudioCache.MIN_ALIGNMENT_PREFIX_BYTES } ?: return null
+         // ~15s of 24-bit FLAC; the audition only fetched the first megabyte.
+         AudioCache.warmRange(upgraded, 0, UPGRADE_ALIGN_HEAD_BYTES)
+-        val source = AudioCache.renditionAt(playingUri) ?: return null
+-        val target = AudioCache.renditionAt(upgraded) ?: return null
+-        if (source.cachedPrefix < AudioCache.MIN_ALIGNMENT_PREFIX_BYTES ||
+-            target.cachedPrefix < AudioCache.MIN_ALIGNMENT_PREFIX_BYTES
+-        ) {
+-            return null
+-        }
++        val target = AudioCache.renditionAt(upgraded)
++            ?.takeIf { it.cachedPrefix >= AudioCache.MIN_ALIGNMENT_PREFIX_BYTES } ?: return null
+         return VersionAudioAligner.findRenditionOffsetMs(
+             AudioCache.renditionDataSource(playingUri, source),
+             AudioCache.renditionDataSource(upgraded, target),

@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 17:17:13 +0300
+Subject: [PATCH 42/61] fix(resolver): a manifest-only addon answer is the
+ tapped-track race's last resort again, so a track YouTube can't serve plays
+ from it instead of being skipped
+
+---
+ .../music/bitchord/data/sources/SourceResolver.kt  | 14 +++++++++-----
+ 1 file changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/data/sources/SourceResolver.kt b/app/src/main/java/com/music/bitchord/data/sources/SourceResolver.kt
+index 1651e4b..3896a86 100644
+--- a/app/src/main/java/com/music/bitchord/data/sources/SourceResolver.kt
++++ b/app/src/main/java/com/music/bitchord/data/sources/SourceResolver.kt
+@@ -259,11 +259,15 @@ object SourceResolver {
+         val youtube = active.firstOrNull { it.kind == SourceKind.YOUTUBE } ?: return null
+         val request = requestForNow()
+         // Fork: a manifest (DASH/HLS) can't start a track that was built progressive; take
+-        // the next source's plain file instead. A manifest-only answer still plays via the upgrade.
+-        val (source, stream) = bestAcross(rankedAbove(youtube.configId, active), target, request) { _, s ->
+-            !StreamContainer.isManifest(s.url)
+-        }
+-            ?: return null
++        // the next source's plain file instead. Only when no source has one does the manifest
++        // come back, for the caller's own manifest handling: swapped in under YouTube, or —
++        // when YouTube can't serve the track — played after one typed replay.
++        var manifest: Pair<MusicSource, SourceStream>? = null
++        val (source, stream) = bestAcross(rankedAbove(youtube.configId, active), target, request) { src, s ->
++            val plain = !StreamContainer.isManifest(s.url)
++            if (!plain && manifest == null) manifest = src to s
++            plain
++        } ?: manifest ?: return null
+         // Says what was found, not what the caller will do with it. This
+         // line used to read "substituted" unconditionally, including for
+         // streams the caller went on to refuse — which made a log of a

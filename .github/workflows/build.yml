@@ -18,25 +18,21 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: build
-  cancel-in-progress: false
-
 env:
   UPSTREAM: kushagrasinghx/BitChord
-  GH_TOKEN: ${{ github.token }}
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       tag: ${{ steps.pick.outputs.tag }}
       build: ${{ steps.pick.outputs.build }}
     steps:
       # GitHub disables scheduled workflows after 60 days without repo activity.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with: { fetch-depth: 1 }
       - name: Keep the schedule alive
+        continue-on-error: true   # a rejected push (you pushed at the same moment) must not block a release build
         run: |
           last=$(git log -1 --format=%ct)
           if [ $(( $(date +%s) - last )) -gt $(( 50 * 86400 )) ]; then
@@ -46,44 +42,68 @@ jobs:
           fi
       - id: pick
         env:
+          GH_TOKEN: ${{ github.token }}
           TAG_IN: ${{ inputs.tag }}
           EVENT: ${{ github.event_name }}
         run: |
           tag="${TAG_IN:-$(gh release view -R "$UPSTREAM" --json tagName -q .tagName)}"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           # A schedule only builds a release not built yet; a push or a manual run always builds.
-          built=$(gh release list -R "$GITHUB_REPOSITORY" -L 100 --json tagName -q ".[].tagName" | grep -c "^$tag\." || true)
+          # Listed on its own line so an API failure fails the step instead of reading as "0 built".
+          names=$(gh release list -R "$GITHUB_REPOSITORY" -L 100 --json tagName -q ".[].tagName")
+          built=$(grep -c "^$tag\." <<<"$names" || true)
           if [ "$EVENT" != schedule ] || [ "$built" = 0 ]; then echo "build=true" >> "$GITHUB_OUTPUT"; fi
           echo "upstream $tag, built here $built time(s), event $EVENT"
 
   build:
     needs: check
     if: needs.check.outputs.build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04   # pinned: ubuntu-latest moves to 26.04 in Oct-Nov 2026; move on purpose
     timeout-minutes: 90
+    # Here, not on the workflow: a schedule run that builds nothing must not cancel a
+    # waiting patch build. A newer build replacing a waiting one is fine (it has its commits).
+    concurrency:
+      group: build
+      cancel-in-progress: false
     env:
       TAG: ${{ needs.check.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           repository: kushagrasinghx/BitChord
-          ref: ${{ needs.check.outputs.tag }}
-          fetch-depth: 0   # git am --3way needs the blobs the patches were made against
-      - uses: actions/checkout@v4
+          # The tag, not upstream's release branch of the same name, which keeps moving.
+          ref: refs/tags/${{ needs.check.outputs.tag }}
+          fetch-depth: 0   # the patches' base tag, and history for the rebase
+          persist-credentials: false   # no write token on disk while upstream's build scripts run
+      - uses: actions/checkout@v5
         with:
           path: own
+          persist-credentials: false
 
       - name: Apply patches
         run: |
           git config user.name "bitchord-personal CI"
           git config user.email "ci@users.noreply.github.com"
-          git am --3way own/patches/*.patch || {
-            echo "::error::A patch no longer applies to $TAG. Rebase the fork branch onto $TAG and re-export patches/."
+          base=$(cat own/patches/BASE)
+          # On their own base the patches always apply. git am's 3-way fallback can't help on any
+          # other tag (it needs blobs that exist only where the patches were made); a rebase merges
+          # real commits, and drops patches upstream merged unchanged (PR #932).
+          git checkout -q -B personal "refs/tags/$base"
+          git am -q own/patches/*.patch || {
+            echo "::error::patches/ does not apply to its own base $base: re-export it (scripts/export-patches.sh)."
             git am --show-current-patch=diff | head -80
             exit 1
           }
+          if [ "$base" != "$TAG" ]; then
+            git rebase -q --onto "refs/tags/$TAG" "refs/tags/$base" personal || {
+              echo "::error::A patch no longer applies to $TAG. Rebase the fork branch onto $TAG and re-export patches/."
+              git status --short | grep -E '^(UU|AA|DU|UD) ' || true
+              git diff | head -80
+              exit 1
+            }
+          fi
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           java-version: '17'
           distribution: temurin
@@ -110,15 +130,17 @@ jobs:
             -Pbitchord.forkRevision=$((100 + ${{ github.run_number }})) -Pbitchord.bundleWear=false
 
       - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           # Read back from the build, so the tag is exactly what the app reports.
-          version=$(jq -r '.elements[0].versionName' app/build/outputs/apk/prod/release/output-metadata.json)
+          version=$(jq -er '.elements[0].versionName' app/build/outputs/apk/prod/release/output-metadata.json)
           # Only the arm64 split: the updater takes a universal APK first, and that one is 170 MB.
           apk="BitChord-v${version}_arm64-v8a.apk"
           cp app/build/outputs/apk/prod/release/app-prod-arm64-v8a-release.apk "$apk"
           {
-            echo "Upstream $UPSTREAM $TAG ($(git rev-parse --short "$TAG")) plus:"
-            git log --format='- %s' "$TAG"..HEAD
+            echo "Upstream $UPSTREAM $TAG ($(git rev-parse --short "refs/tags/$TAG^{commit}")) plus:"
+            git log --format='- %s' "refs/tags/$TAG"..HEAD
             echo
             echo "---"
             gh release view "$TAG" -R "$UPSTREAM" --json body -q .body || true

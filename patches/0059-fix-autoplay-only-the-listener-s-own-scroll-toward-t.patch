@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 17:22:01 +0300
+Subject: [PATCH 59/61] fix(autoplay): only the listener's own scroll toward
+ the queue's end loads more AutoPlay, not the offscreen layout and Now-playing
+ scroll on every song change (which overrode short AutoPlay lengths)
+
+---
+ .../kotlin/com/music/bitchord/ui/player/PlayerQueue.kt       | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/PlayerQueue.kt b/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/PlayerQueue.kt
+index d43a771..672241a 100644
+--- a/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/PlayerQueue.kt
++++ b/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/PlayerQueue.kt
+@@ -244,11 +244,14 @@ internal fun InlineQueue(
+     val keepScroll = remember(listState) { keepScrollInList(listState) }
+     // Fork: nearing the last rows asks for more AutoPlay, once per arrival — 10 rows
+     // early, so the batch usually lands before the list runs out under the thumb.
++    // Only on the listener's own scroll down: the list is also laid out offscreen and
++    // scrolled to Now playing on every song change, which grew a short queue unasked.
+     LaunchedEffect(listState, autoplayEnabled, controlsLocked) {
+         if (!autoplayEnabled || controlsLocked) return@LaunchedEffect
+         snapshotFlow {
+             val info = listState.layoutInfo
+-            info.totalItemsCount > 0 && (info.visibleItemsInfo.lastOrNull()?.index ?: -1) >= info.totalItemsCount - 10
++            listState.isScrollInProgress && listState.lastScrolledForward &&
++                info.totalItemsCount > 0 && (info.visibleItemsInfo.lastOrNull()?.index ?: -1) >= info.totalItemsCount - 10
+         }.distinctUntilChanged().filter { it }.collect { QueueEndHook.onNearEnd() }
+     }
+     val controlsOnScroll = rememberPlayerControlsOnScroll(

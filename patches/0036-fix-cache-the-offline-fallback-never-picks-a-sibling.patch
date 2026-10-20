@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 17:15:51 +0300
+Subject: [PATCH 36/61] fix(cache): the offline fallback never picks a sibling
+ copy for an entry still being filled (its first 5 MB isn't a span yet), so a
+ connectivity blip can't move a playing track onto another file
+
+---
+ app/src/main/java/com/music/bitchord/playback/AudioCache.kt | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+index 2eb4cb8..ca997b4 100644
+--- a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
++++ b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+@@ -578,6 +578,8 @@ object AudioCache {
+         // Ahead of the connectivity check, which is a binder call: nearly every
+         // open is of an entry that already holds something.
+         if (cache.getCachedSpans(preferred).isNotEmpty()) return null
++        // Fork: nor one being filled right now — a network blip there moved a playing track onto a sibling file.
++        if (fillerOf(preferred) != null) return null
+         val siblings = listOf(
+             videoId, "$videoId$ALT_SUFFIX", "$videoId$ALT_SUFFIX-noatmos", "$videoId#src", "$videoId#src-noatmos",
+         ).filter { it != preferred }

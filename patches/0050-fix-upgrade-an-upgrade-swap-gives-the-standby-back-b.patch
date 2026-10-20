@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 17:18:45 +0300
+Subject: [PATCH 50/61] fix(upgrade): an upgrade swap gives the standby back
+ before a plain crossfade arms, instead of holding it through the arm point
+ (late, shortened blend)
+
+---
+ .../music/bitchord/playback/CrossfadeController.kt | 14 ++++++++++++++
+ .../com/music/bitchord/playback/PlaybackService.kt |  5 ++++-
+ 2 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
+index 4fa96cd..44c87f8 100644
+--- a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
++++ b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
+@@ -586,6 +586,20 @@ class CrossfadeController(
+     /** Fork: an Advanced Automix ease-back is still walking a player's speed. */
+     fun isEasing(): Boolean = easing != null
+ 
++    /**
++     * Fork: ms of [player]'s track left before an idle tick would hold its end for, or arm, a
++     * plain crossfade — null when none is coming. A version swap blocks both while it runs, so
++     * one still going then makes the blend start late and short.
++     * ponytail: plain crossfade only; Automix arms off its plan's mix-out point.
++     */
++    fun msBeforeArm(player: ExoPlayer): Long? {
++        if (AppSettings.smartFadeEnabled.value || configuredFadeMs() <= 0L) return null
++        if (!player.hasNextMediaItem() || player.repeatMode == Player.REPEAT_MODE_ONE) return null
++        val duration = player.duration.takeIf { it != C.TIME_UNSET && it > 0L } ?: return null
++        val lead = maxOf(fadeFor(duration) + ARM_LEAD_MS, maxReadAheadMs(player) + HOLD_AHEAD_MS)
++        return duration - player.currentPosition - lead
++    }
++
+     /** Applies the listener's speed without exposing AudioTrack's parameter-change click. */
+     fun applyPlaybackSpeed(speed: Float) {
+         if (isTransitioning()) return
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index f0ca742..0ea01a3 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -4802,7 +4802,10 @@ class PlaybackService : MediaLibraryService() {
+                 activePlayer.currentMediaItemIndex == currentIndex &&
+                 swapPointFor(mediaId)?.uri == now.uri &&
+                 QualityUpgrade.forcedStream(Uri.parse(upgradedUri)) != null &&
+-                activePlayer.playbackSuppressionReason == Player.PLAYBACK_SUPPRESSION_REASON_NONE
++                activePlayer.playbackSuppressionReason == Player.PLAYBACK_SUPPRESSION_REASON_NONE &&
++                // Fork: handed back before a plain crossfade wants the standby; the re-offer then
++                // meets swapIn's 20s floor and the track ends on the copy it has.
++                (crossfade?.msBeforeArm(activePlayer) ?: 1L) > 0L
+ 
+             // Main thread, no suspension until adoptPlayerForVersionSwap: queue edits made
+             // while this buffered (AutoPlay append, Play next, remove/move) are carried

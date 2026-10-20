@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 17:18:01 +0300
+Subject: [PATCH 47/61] fix(upgrade): the swap's standby phase counts as an
+ audition, so a missed alignment no longer leaves the stats line claiming the
+ addon's FLAC over the YouTube copy still playing
+
+---
+ .../java/com/music/bitchord/playback/PlaybackService.kt     | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index 1f4b6e8..60b90a2 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -4768,6 +4768,9 @@ class PlaybackService : MediaLibraryService() {
+         }
+ 
+         sourceSwapActive = true
++        // Fork: the standby opens the upgrade past the audition's bytes, and none of it is playing
++        // until adopt(): no stats claim for it (swapIn records them on success).
++        QualityUpgrade.beginAudition(mediaId)
+         var adopted = false
+         try {
+             val newItems = (0 until activePlayer.mediaItemCount).map { i ->
+@@ -4915,6 +4918,8 @@ class PlaybackService : MediaLibraryService() {
+                     delay(ALIGN_STEP_MS)
+                     off = settledOffBy()
+                 }
++                // Skipped or reverted (an audition survives a skip): the finally shelves; not a miss.
++                if (!stillWanted()) return false
+                 if (nudging) {
+                     standbyPlayer.setPlaybackSpeed(baseSpeed)
+                     delay(ALIGN_STEP_MS)
+@@ -5014,6 +5019,7 @@ class PlaybackService : MediaLibraryService() {
+                 swappingMediaId = null
+             }
+             sourceSwapActive = false
++            QualityUpgrade.endAudition(mediaId)
+         }
+     }
+ 

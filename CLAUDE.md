@@ -9,27 +9,33 @@ This file is the hand-over: read it before touching the patches. Deeper backgrou
 - `patches/` — the fork, as `git format-patch` output; `patches/BASE` = the upstream tag they were made on.
 - `scripts/setup-fork.sh` — clones upstream next to this repo (`../fork`) and rebuilds branch `personal` from the patches.
 - `scripts/export-patches.sh` — writes branch `personal` back into `patches/`.
-- `.github/workflows/build.yml` — every 6 h: newest upstream release + `git am --3way patches/*.patch` → signed APK → GitHub Release. A push to `patches/**` also builds. Keeps itself alive past GitHub's 60-day cutoff.
+- `.github/workflows/build.yml` — every 6 h: `git am patches/*.patch` on `patches/BASE`, `git rebase` onto upstream's newest release tag → signed APK → GitHub Release. A push to `patches/**` also builds. Keeps itself alive past GitHub's 60-day cutoff. Never rename it: `run_number` (the revision) restarts at 1.
 - `docs/research/` — today's reports: lookahead design, Automix, PR #932 review, fork review, addon backends, QOL sweep.
 
 ## New PC setup
 
-1. JDK **17** (Gradle 8.11.1 does not run on JDK 25). Android SDK with platform 37, NDK 27.1.12297006, CMake 3.22.1.
+1. JDK **17** (Gradle 8.11.1 does not run on JDK 25; Fedora packages only 21/25, this PC has Temurin in `~/.jdks/jdk-17.0.19+10`).
+   `sdkmanager "platforms;android-36" "platforms;android-37.0" "ndk;27.0.12077973" "cmake;3.22.1"` (NDK = AGP 8.10.1's
+   default, no `ndkVersion` is set; CI installs the same). `git config --global user.name/user.email` (`git am` needs a committer).
 2. AGP 8.10.1 wants `platforms/android-37`, but sdkmanager installs `android-37.0`. Copy it to `android-37` and set
    `AndroidVersion.ApiLevel=37` in `source.properties` and `platforms;android-37` / `<api-level>37</api-level>` in `package.xml`.
-3. `scripts/setup-fork.sh` → `../fork` on branch `personal`. Add `local.properties` (`sdk.dir=…`).
+3. `scripts/setup-fork.sh` → `../fork` on branch `personal` (refuses an existing `personal`: export first, or `FORCE=1`).
+   Add `local.properties` (`sdk.dir=…`).
 4. Signing key: private repo `akunieminen/bitchord-signing` → put `keystore.properties` (fix `storeFile` path) in `../fork`.
-   Every APK must be signed with this key or Android refuses the update. CI has it as repo secrets.
+   Every APK must be signed with this key or Android refuses the update. CI has it as repo secrets. A wrong `storeFile`
+   does not fail the build: it writes `…-release-unsigned.apk` and leaves any old signed APK in place.
 
 ## Change loop
 
 ```sh
 cd ../fork                                   # branch personal
 # edit, then commit (one concern per commit; prefix "fork:" or "fix(...):")
-JAVA_HOME=<jdk17> ./gradlew :app:assembleProdRelease -Pbitchord.forkRevision=7 -Pbitchord.bundleWear=false
-aapt2 dump badging app/build/outputs/apk/prod/release/app-prod-arm64-v8a-release.apk | head -1   # CHECK versionName
-adb install -r app/build/outputs/apk/prod/release/app-prod-arm64-v8a-release.apk
-cd ../bitchord-personal && scripts/export-patches.sh && git add -A && git commit -m "…" && git push   # CI publishes
+apk=app/build/outputs/apk/prod/release/app-prod-arm64-v8a-release.apk
+rm -f "$apk" &&                              # a killed build can't leave an old APK to install
+JAVA_HOME=<jdk17> ./gradlew :app:assembleProdRelease -Pbitchord.forkRevision=7 -Pbitchord.bundleWear=false &&
+~/Android/Sdk/build-tools/36.0.0/aapt2 dump badging "$apk" | head -1 &&   # CHECK versionName
+adb install -r "$apk"
+cd ../bitchord-personal && git pull --rebase && scripts/export-patches.sh && git add -A && git commit -m "…" && git push   # CI publishes
 ```
 
 - Local test builds use `forkRevision` 1–99; CI uses `100 + run_number`, so a CI release always outranks a local build
@@ -39,9 +45,16 @@ cd ../bitchord-personal && scripts/export-patches.sh && git add -A && git commit
 - `e: … Module was compiled with an incompatible version of Kotlin` from `:sharedUi:lintVitalAnalyzeRelease` is noise.
 - `v1.8.1` is both a tag and a branch upstream: use `refs/tags/v1.8.1` in git commands.
 - Upstream cuts releases from version branches, not `main` (v1.8.1 was 59 commits ahead of main). Base on tags.
-- New upstream release breaks a patch → CI fails and GitHub emails. Fix: `git fetch origin tag vNEW`,
-  `git rebase --onto refs/tags/vNEW refs/tags/vOLD personal`, resolve, build, `scripts/export-patches.sh vNEW`, push.
-  Drop the three PR #932 commits once upstream merges that PR.
+- **Export and push after every fork commit that goes on the phone.** CI builds only `patches/`, and its
+  revision (100+) outranks local builds, so the updater offers an older CI build over a newer local one.
+- New upstream release: `git fetch origin tag vNEW`, `git rebase --onto refs/tags/vNEW refs/tags/vOLD personal`,
+  resolve, build, `scripts/export-patches.sh vNEW`, push. Needed when a patch breaks (CI fails and GitHub emails)
+  **and** when CI built vNEW fine: the phone then has vNEW's higher versionCode (1.8→1.8.1 went 26→29), so a vOLD
+  build fails `adb install` with `INSTALL_FAILED_VERSION_DOWNGRADE`. The export script refuses a tag `personal` isn't on.
+- PR #932 merged upstream unchanged: the rebase (and CI) drops its three commits itself. Merged with edits: the rebase
+  stops at "feat(settings)…" — `git rebase --skip` those three, then re-resolve the later PR-932/upgrade-crossfade patches.
+- The CI keepalive pushes an empty commit to `main` after 50 quiet days: `git pull --rebase` before pushing.
+- Imports are the most common rebase conflict: in upstream files, prefer a fully qualified name over a new import.
 
 ## Phone testing
 
@@ -60,7 +73,7 @@ cd ../bitchord-personal && scripts/export-patches.sh && git add -A && git commit
 | Concern | Where |
 |---|---|
 | Fork settings (`ForkSettings`, Settings → Fork tweaks, English only, own prefs file) | `data/settings/ForkSettings.kt`, `ui/screens/ForkTweaksGroup.kt`, 1-line hooks |
-| Addon lookahead: ADDON joins `prefetchSubstitute`; pins next **and** next+1 (`pinSubstitute`: first pin wins, re-stamp, no pin over YouTube bytes, no manifests, misses remembered 10 min); 2 s read-ahead; read-ahead while paused | `SourceResolver.kt`, `AudioCache.kt`, `PlaybackService.kt` |
+| Addon lookahead: ADDON joins `prefetchSubstitute`; pins next **and** next+1 (`pinSubstitute`: first pin wins, re-stamp, no pin over YouTube bytes, misses remembered 10 min); the lookahead and tapped-track races prefer a plain file over a DASH/HLS manifest (a manifest-only answer is the last resort); 2 s read-ahead; read-ahead while paused | `SourceResolver.kt`, `AudioCache.kt`, `PlaybackService.kt` |
 | Upstream bug: read-ahead checked the plain key but wrote `#alt` → stopped at 64 kB; whole-file length from `Content-Range` | `AudioCache.kt` |
 | Head start: an unpinned open waits `headStartMs` (4 s) for the addons before YouTube; skipped for known misses | `PlaybackService.resolveWithModulePriority` |
 | No upgrade after a blend (only when the smooth swap is off) | `PlaybackService.kt` (`blendedIn`) |
@@ -70,8 +83,10 @@ cd ../bitchord-personal && scripts/export-patches.sh && git add -A && git commit
 | Audio sessions: two fixed sessions, both advertised to effect apps | `PlaybackService.kt` |
 | QOL: BT reconnect resume, unplayable toast, sleep fade + 5/10 min, source on stats line | `PlaybackService.kt`, `SleepTimer.kt`, `PlayerControls.kt` |
 | Updater → this repo; `.forkRevision` versionName; TrackLog to logcat | `AppUpdateChecker.kt`, `app/build.gradle.kts`, `AndroidStreamHooks.kt` |
-| Upgrade swap: offset measured on the audio (`VersionAudioAligner.findRenditionOffsetMs`, decodes both cached heads), then the muted standby is **speed-nudged** to within 20 ms (never re-seeked) and a 150 ms blend; no fade at all if it can't align; 5 misses end the re-offers | `PlaybackService.kt` (`seamlessSwapToStream`, `measureUpgradeOffset`), `VersionAudioAligner.kt` |
+| Upgrade swap: offset measured on the audio (`VersionAudioAligner.findRenditionOffsetMs`, decodes both cached heads), then the muted standby is **speed-nudged** to within 20 ms (seek aimed ahead by a learned seek lag, never re-seeked) and a 150 ms blend; no fade at all if it can't align; 5 misses end the re-offers | `PlaybackService.kt` (`seamlessSwapToStream`, `measureUpgradeOffset`), `VersionAudioAligner.kt` |
 | `#src` key: a track whose `#alt` holds a kept YouTube copy *and that an addon has served* (`bc_addon_has` flag) is filed under `#src`, so replays (Listen again) start from the addon; memoized per process, never chosen offline | `AudioCache.kt` (`substituteKey`, `recordServed`, `completeSibling`) |
+| Loudness for pinned tracks: one YouTube resolve per minute for the current and next track, only for the loudness figure | `PlaybackService.ensureLoudnessFigure` |
+| Final audit (2026-10-20, 29 fixes): lapsed pins honoured for their own entry; a pin barred by the cellular ceiling dropped only if no entry holds its bytes; `#src`→`#alt` when YouTube wins a replay; no pins for local/SMB/WebDAV or while casting; one upgrade swap owns the standby, hands it back before a crossfade arms; sleep fade in the loudness stage; reconnect resume and AutoPlay load-more re-check when they fire | `AudioCache.kt`, `StreamChoice.kt`, `PlaybackService.kt`, `CrossfadeController.kt`, `PlayerQueue.kt` |
 | Addon trouble ≠ miss: `AddonClient.lastTroubleAtMs` (429/5xx/timeouts); misses only remembered when no trouble during the lookup; spoiled next-track lookups retried 3 × 20 s | `AddonClient.kt`, `AudioCache.kt` |
 
 ## Gotchas learned the hard way
@@ -84,7 +99,12 @@ cd ../bitchord-personal && scripts/export-patches.sh && git add -A && git commit
   `id#<rendition>`). Anything checking cached bytes must use the same key. Never finish a YouTube prefix from another
   file (splice → mid-song decoder failure).
 - **`StreamChoice` pins** live 15 min; the player trusts a pin before any race. Re-pinning while a player fills `#alt`
-  splices two files — hence "first pin wins".
+  splices two files — hence "first pin wins". A lapsed substitute pin is still honoured while its entry holds (or is
+  filling with) addon bytes (`AudioCache.pinFor`, `StreamChoice.lapsed`): a dead URL then 403s into recovery.
+- An entry's first 5 MB (Media3's CacheDataSink fragment) is not a span until committed: "is this entry in use" is
+  the `bc_origin` tag `recordServed` writes before the first byte (`AudioCache.fillerOf`), not `getCachedSpans`.
+- Only the queue's lookahead asks addons (`prefetchSubstitute(withAddons = true)`); the search top-result warm-up is
+  upstream's (JioSaavn only), because it overwrites pins.
 - **The YouTube URL warm-up is also where a track's loudness figure comes from**; skipping it for pinned tracks
   silently disabled volume levelling.
 - **Addons are raced, not ordered:** the first acceptable answer wins and losers still get requests. Keep the set small
@@ -109,9 +129,13 @@ read-ahead; keep complete addon FLACs in cache; "remove from history"; playlist 
 (touches a large, busy upstream file). Rejected: `setPrioritizeTimeOverSizeThresholds` hi-res buffer (+~50 MB heap
 on an app already at its 256 MB cap).
 
-Review leftovers (see `docs/research/04-fork-review.md`, `06-qol-sweep.md`): pin TTL vs a long read-ahead; the
-next+1 pin runs inline before the URL warm-up; head start vs `ARM_LEAD_MS` when Automix is on; queue edits while
-paused keep reading the old next; TV builds poll this repo.
+Review leftovers (see `docs/research/04-fork-review.md`, `06-qol-sweep.md`): the next+1 pin runs inline before the
+URL warm-up; head start vs `ARM_LEAD_MS` when Automix is on; an upgrade swap vs an *Automix* arm point (plain crossfade
+is handled); queue edits while paused keep reading the old next; TV builds poll this repo; `#src` copies the old build
+already duplicated stay until LRU eviction; a signing secret equal to the word `bitchord` masks it in CI logs. Final-audit critic's open nice-to-haves: Advanced
+Automix phase lock drops the kept tempo; AutoPlay load-more can still fire from the Now-playing auto-scroll with queue
+history on and <18 tracks ahead; `StreamChoice.isSubstitute` stays true for an expired addon choice; an upgrade
+started <34 s before the end downloads a head it then abandons; no unit tests for `StreamChoice.lapsed`/`msBeforeArm`.
 
 Upstream candidates — **ask the owner before posting anything public**: the 64 kB read-ahead fix; PR #932's
 restart-at-0:00 bug; the audio-session bug above.

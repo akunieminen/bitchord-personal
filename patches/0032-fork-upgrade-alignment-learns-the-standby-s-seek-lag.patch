@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 16:02:58 +0300
+Subject: [PATCH 32/61] fork: upgrade alignment learns the standby's seek lag
+ and aims ahead by it; nudges up to 15% with settle time per step and
+ re-checks at normal speed
+
+---
+ .../bitchord/playback/PlaybackService.kt      | 48 +++++++++++++------
+ 1 file changed, 33 insertions(+), 15 deletions(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index 25c52c5..589c564 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -4708,6 +4708,9 @@ class PlaybackService : MediaLibraryService() {
+         )?.takeIf { abs(it) <= 5_000L }
+     }
+ 
++    /** Fork: how far behind the standby's resync seek lands, learned across upgrades. */
++    private var standbySeekLagMs = 300L // ponytail: starting guess from today's logs (125-450ms)
++
+     /** Fork: failed alignments per track; see the re-seek in [seamlessSwapToStream]. */
+     private val alignmentMisses = HashMap<String, Int>()
+ 
+@@ -4843,7 +4846,8 @@ class PlaybackService : MediaLibraryService() {
+                     delay(10)
+                 }
+                 if (standbyPlayer.isPlaying) {
+-                    standbyPlayer.seekTo(currentIndex, activePlayer.currentPosition + offset)
++                    // Fork: aimed ahead by the start-up lag this seek has been measured to cost.
++                    standbyPlayer.seekTo(currentIndex, activePlayer.currentPosition + offset + standbySeekLagMs)
+                     val resyncTimeout = SystemClock.elapsedRealtime() + 300L
+                     while (coroutineContext.isActive && standbyPlayer.playbackState != Player.STATE_READY && SystemClock.elapsedRealtime() < resyncTimeout) {
+                         delay(10)
+@@ -4872,27 +4876,40 @@ class PlaybackService : MediaLibraryService() {
+                 }
+                 delay(ALIGN_SETTLE_MS)
+                 var off = settledOffBy()
+-                TrackLog.d("BitChord", "upgrade crossfade: standby ${off}ms behind once settled", about = mediaId)
++                TrackLog.d("BitChord", "upgrade crossfade: standby ${off}ms behind once settled (aimed ${standbySeekLagMs}ms ahead)", about = mediaId)
++                // Learn what the resync seek costs, so the next one lands closer: the lag that
++                // would have made this one land on the spot. ponytail: EWMA 1/3, clamped.
++                standbySeekLagMs = ((standbySeekLagMs * 2 + (standbySeekLagMs + off)) / 3).coerceIn(0L, 1_500L)
+                 if (abs(off) > 1_500L) {
+                     // Too far to nudge in reasonable time: one coarse seek, then settle again.
+-                    standbyPlayer.seekTo(currentIndex, activePlayer.currentPosition + offset)
++                    standbyPlayer.seekTo(currentIndex, activePlayer.currentPosition + offset + standbySeekLagMs)
+                     delay(ALIGN_SETTLE_MS)
+                     off = settledOffBy()
+                 }
++                // Nudge until within tolerance *at normal speed*: a speed change takes a moment
++                // to show in the position, so each step waits it out, and the final reset to
++                // normal speed is measured again rather than trusted.
+                 val alignBy = SystemClock.elapsedRealtime() + ALIGN_BUDGET_MS
+-                while (coroutineContext.isActive && abs(off) > ALIGN_TOLERANCE_MS &&
+-                    SystemClock.elapsedRealtime() < alignBy && stillWanted()
+-                ) {
+-                    // Catch up over ~1.5s, never more than 8% off speed.
+-                    // ponytail: proportional only; add damping if the log shows it hunting
+-                    val nudge = (off / 1_500f).coerceIn(-0.08f, 0.08f)
+-                    standbyPlayer.setPlaybackSpeed(baseSpeed * (1f + nudge))
+-                    delay(250)
++                var nudging = false
++                while (coroutineContext.isActive && SystemClock.elapsedRealtime() < alignBy && stillWanted()) {
++                    if (abs(off) <= ALIGN_TOLERANCE_MS) {
++                        if (!nudging) break
++                        standbyPlayer.setPlaybackSpeed(baseSpeed)
++                        nudging = false
++                    } else {
++                        // Proportional, up to 15% off speed; the muted standby can take it.
++                        val nudge = (off / 1_000f).coerceIn(-0.15f, 0.15f)
++                        standbyPlayer.setPlaybackSpeed(baseSpeed * (1f + nudge))
++                        nudging = true
++                    }
++                    delay(ALIGN_STEP_MS)
++                    off = settledOffBy()
++                }
++                if (nudging) {
++                    standbyPlayer.setPlaybackSpeed(baseSpeed)
++                    delay(ALIGN_STEP_MS)
+                     off = settledOffBy()
+                 }
+-                standbyPlayer.setPlaybackSpeed(baseSpeed)
+-                delay(150)
+-                off = settledOffBy()
+                 TrackLog.d("BitChord", "upgrade crossfade: aligned to ${off}ms", about = mediaId)
+                 if (abs(off) > ALIGN_TOLERANCE_MS * 2) {
+                     // Not close enough to blend two copies of one recording without a doubling:
+@@ -9471,7 +9488,8 @@ class PlaybackService : MediaLibraryService() {
+         /** Fork: at most one loudness-only YouTube resolve per track per minute. */
+         const val LOUDNESS_ASK_INTERVAL_MS = 60_000L
+         const val ALIGN_SETTLE_MS = 600L
+-        const val ALIGN_BUDGET_MS = 6_000L
++        const val ALIGN_BUDGET_MS = 10_000L
++        const val ALIGN_STEP_MS = 400L
+ 
+         /** Loaded media bytes an audition needs before its buffered position is believed. */
+         const val MIN_PROVEN_LOAD_BYTES = UPGRADE_HEADER_BYTES

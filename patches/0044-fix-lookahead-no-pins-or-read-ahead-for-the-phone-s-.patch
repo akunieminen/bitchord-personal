@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 17:17:26 +0300
+Subject: [PATCH 44/61] fix(lookahead): no pins or read-ahead for the phone's
+ paused queue while casting; the receiver streams its own URL
+
+---
+ .../java/com/music/bitchord/playback/PlaybackService.kt     | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index c4f6485..c9d4878 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -6499,6 +6499,12 @@ class PlaybackService : MediaLibraryService() {
+      * tracks is more than it does anything with, but it decides that, not this.
+      */
+     private fun prefetchAround(player: ExoPlayer) {
++        // Fork: a Cast receiver streams its own URL; the held-paused local queue needs no read-ahead.
++        // (Not the watch: it reads through this cache.) Casting ends with a local play, which comes back here.
++        if (castPlayback.active) {
++            cancelPrefetch()
++            return
++        }
+         val nextIndex = player.nextMediaItemIndex
+         val upcomingSongs = if (nextIndex != C.INDEX_UNSET) {
+             val end = (nextIndex + AudioCache.QUEUE_DEPTH - 1).coerceAtMost(player.mediaItemCount - 1)

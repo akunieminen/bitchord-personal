@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 17:17:43 +0300
+Subject: [PATCH 46/61] fix(upgrade): one upgrade swap owns the standby at a
+ time; a second re-offer of the same track could stop the player the first had
+ just adopted (silence, empty queue)
+
+---
+ .../com/music/bitchord/playback/PlaybackService.kt    | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index 7160d5d..1f4b6e8 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -4749,7 +4749,9 @@ class PlaybackService : MediaLibraryService() {
+         // next progress tick re-offers the shelved stream.
+         // Fork: asks the controller rather than comparing speeds — a tempo kept from a mix
+         // is not an ease, and treating it as one re-auditioned the upgrade every 5s.
+-        if (canCrossfade && (versionSwapJob?.isActive == true || crossfade?.isEasing() == true)) {
++        // Fork: or another upgrade's swap owns it — a re-offer launched after a skip and back
++        // while the first was still aligning, whose exit then stopped the player just adopted.
++        if (sourceSwapActive || (canCrossfade && (versionSwapJob?.isActive == true || crossfade?.isEasing() == true))) {
+             QualityUpgrade.shelve(mediaId, stream)
+             return false
+         }
+@@ -5002,8 +5004,11 @@ class PlaybackService : MediaLibraryService() {
+                 if (QualityUpgrade.forcedStream(Uri.parse(upgradedUri)) != null) {
+                     QualityUpgrade.shelve(mediaId, stream)
+                 }
+-                standbyPlayer.stop()
+-                standbyPlayer.clearMediaItems()
++                // Never the session's player (belt and braces for the gate above).
++                if (standbyPlayer !== player) {
++                    standbyPlayer.stop()
++                    standbyPlayer.clearMediaItems()
++                }
+                 standbyPlayer.volume = 1f
+                 activePlayer.volume = 1f
+                 swappingMediaId = null

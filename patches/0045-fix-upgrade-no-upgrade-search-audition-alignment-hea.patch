@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 17:17:34 +0300
+Subject: [PATCH 45/61] fix(upgrade): no upgrade search, audition, alignment
+ head or standby swap on the paused phone player while a Cast receiver or the
+ watch is the speaker
+
+---
+ .../main/java/com/music/bitchord/playback/PlaybackService.kt   | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index c9d4878..7160d5d 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -4400,6 +4400,9 @@ class PlaybackService : MediaLibraryService() {
+      * instead — see [adoptCachedTrack] and [QualityUpgrade.adoptUnresolved].
+      */
+     private fun lookForBetterCopy(player: ExoPlayer) {
++        // Fork: a receiver is the speaker, so the phone's copy is unheard. The pending upgrade
++        // waits: onIsPlayingChanged runs this again once the phone plays.
++        if (speakers.active) return
+         val item = player.currentMediaItem ?: return
+         val mediaId = item.mediaId
+         val uri = item.localConfiguration?.uri

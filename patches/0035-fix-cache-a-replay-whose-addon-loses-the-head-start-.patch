@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 17:15:44 +0300
+Subject: [PATCH 35/61] fix(cache): a replay whose addon loses the head start
+ reads the YouTube copy kept under #alt instead of downloading it again into
+ #src (which also left the track YouTube-first for good)
+
+---
+ .../com/music/bitchord/playback/AudioCache.kt     | 15 +++++++++++++++
+ .../music/bitchord/playback/PlaybackService.kt    |  4 ++++
+ 2 files changed, 19 insertions(+)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+index 1664914..2eb4cb8 100644
+--- a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
++++ b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+@@ -558,6 +558,21 @@ object AudioCache {
+         }
+     }
+ 
++    /**
++     * Fork: YouTube won the race for an empty `#src` while `#alt` holds the YouTube copy that
++     * moved it there (an addon slower than the head start, a 429). Downloading that copy again
++     * into `#src` also left the track YouTube-first for good, so the track goes back to `#alt`
++     * for this process and the player's immediate retry reads (and finishes) the copy on disk.
++     */
++    fun backToAlt(videoId: String, key: String?): Boolean {
++        if (!::cache.isInitialized || key != "$videoId#src${atmosKeySuffix()}") return false
++        val alt = "$videoId$ALT_SUFFIX${atmosKeySuffix()}"
++        if (cache.getCachedSpans(key).isNotEmpty() || fillerOf(key) != null) return false
++        if (fillerOf(alt) != Origin.YOUTUBE.name || cache.getCachedSpans(alt).isEmpty()) return false
++        substituteKeys[alt] = alt
++        return true
++    }
++
+     private fun completeSibling(videoId: String, preferred: String): String? {
+         if (!::cache.isInitialized) return null
+         // Ahead of the connectivity check, which is a binder call: nearly every
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index 25d7052..e4354fe 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -1651,6 +1651,10 @@ class PlaybackService : MediaLibraryService() {
+                 // no such deadline, so what was nearly in hand is asked for
+                 // again while the fallback plays.
+                 is Resolved.YouTube -> {
++                    // Fork: Media3 retries at once (0 ms), under the key this switches to.
++                    if (AudioCache.backToAlt(videoId, dataSpec.key)) {
++                        throw java.io.IOException("$videoId: YouTube won; replaying the copy kept under #alt")
++                    }
+                     NerdStats.recordSource(videoId, "YouTube")
+                     val headers = StreamResolver.mediaHeadersFor(won.url)
+                     StreamChoice.remember(videoId, SourceStream(won.url, headers = headers), substituted = false)

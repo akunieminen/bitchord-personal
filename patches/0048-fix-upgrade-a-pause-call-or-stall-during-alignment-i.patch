@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 17:18:21 +0300
+Subject: [PATCH 48/61] fix(upgrade): a pause, call or stall during alignment
+ is not counted as a miss, and a manual 'Upgrade quality' clears the misses
+ instead of getting a single try
+
+---
+ .../com/music/bitchord/playback/PlaybackService.kt    | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index 60b90a2..e8ff4fb 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -4556,6 +4556,8 @@ class PlaybackService : MediaLibraryService() {
+         // answers are discarded. The manifest is intentionally unaffected.
+         SourceRegistry.clearCompletedAddonTrackCalls()
+         QualityUpgrade.askByHand(mediaId)
++        // Fork: and the alignment misses that ended the re-offers, or the listener's request gets one try.
++        alignmentMisses.remove(mediaId)
+         TrackLog.d("BitChord", "upgrade asked for by hand for $mediaId", about = mediaId)
+         blendedIn = null
+         lookForBetterCopy(player)
+@@ -4904,7 +4906,9 @@ class PlaybackService : MediaLibraryService() {
+                 // normal speed is measured again rather than trusted.
+                 val alignBy = SystemClock.elapsedRealtime() + ALIGN_BUDGET_MS
+                 var nudging = false
+-                while (coroutineContext.isActive && SystemClock.elapsedRealtime() < alignBy && stillWanted()) {
++                while (coroutineContext.isActive && SystemClock.elapsedRealtime() < alignBy && stillWanted() &&
++                    activePlayer.isPlaying
++                ) {
+                     if (abs(off) <= ALIGN_TOLERANCE_MS) {
+                         if (!nudging) break
+                         standbyPlayer.setPlaybackSpeed(baseSpeed)
+@@ -4918,8 +4922,9 @@ class PlaybackService : MediaLibraryService() {
+                     delay(ALIGN_STEP_MS)
+                     off = settledOffBy()
+                 }
+-                // Skipped or reverted (an audition survives a skip): the finally shelves; not a miss.
+-                if (!stillWanted()) return false
++                // Skipped, reverted (an audition survives a skip), paused, a call or a stall: the
++                // finally shelves for the re-offer; none of it is a failed alignment.
++                if (!stillWanted() || !activePlayer.isPlaying) return false
+                 if (nudging) {
+                     standbyPlayer.setPlaybackSpeed(baseSpeed)
+                     delay(ALIGN_STEP_MS)

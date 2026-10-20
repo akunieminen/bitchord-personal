@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: akunieminen <aku.nieminen1@gmail.com>
 Date: Tue, 20 Oct 2026 11:58:44 +0300
-Subject: [PATCH 20/29] fix(playback): each player keeps its own audio session
+Subject: [PATCH 20/61] fix(playback): each player keeps its own audio session
  and both are advertised to effect apps, so EQs (Wavelet) stay attached
  through crossfades
 

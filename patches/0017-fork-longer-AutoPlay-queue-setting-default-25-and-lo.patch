@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: akunieminen <aku.nieminen1@gmail.com>
 Date: Tue, 20 Oct 2026 11:17:52 +0300
-Subject: [PATCH 17/29] fork: longer AutoPlay queue (setting, default 25) and
+Subject: [PATCH 17/61] fork: longer AutoPlay queue (setting, default 25) and
  load more when the queue is scrolled to its end
 
 ---

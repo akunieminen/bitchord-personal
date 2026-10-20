@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: akunieminen <aku.nieminen1@gmail.com>
 Date: Tue, 20 Oct 2026 10:28:52 +0300
-Subject: [PATCH 13/29] fork: TrackLog reaches logcat in release builds
+Subject: [PATCH 13/61] fork: TrackLog reaches logcat in release builds
 
 ---
  .../com/music/bitchord/data/innertube/AndroidStreamHooks.kt    | 3 ++-

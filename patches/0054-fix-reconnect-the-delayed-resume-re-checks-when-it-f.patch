@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 17:19:38 +0300
+Subject: [PATCH 54/61] =?UTF-8?q?fix(reconnect):=20the=20delayed=20resume?=
+ =?UTF-8?q?=20re-checks=20when=20it=20fires=20=E2=80=94=20a=20pause=20pres?=
+ =?UTF-8?q?sed=20in=20the=201.5s=20window=20wins,=20and=20a=20speaker=20th?=
+ =?UTF-8?q?at=20dropped=20again=20doesn't=20start=20the=20music=20on=20the?=
+ =?UTF-8?q?=20phone's=20loudspeaker?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ .../java/com/music/bitchord/playback/PlaybackService.kt  | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index b3396cc..b34b147 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -538,6 +538,9 @@ class PlaybackService : MediaLibraryService() {
+     /** Fork: when a disconnecting output (AUDIO_BECOMING_NOISY) paused playback, or 0. */
+     private var noisyPausedAt = 0L
+ 
++    /** Fork: the pending resume after that output came back. */
++    private var reconnectResume: Job? = null
++
+     private val outputDeviceCallback = object : AudioDeviceCallback() {
+         override fun onAudioDevicesAdded(addedDevices: Array<AudioDeviceInfo>) {
+             // Plugging something in moves the music to it. Always — a choice
+@@ -556,8 +559,11 @@ class PlaybackService : MediaLibraryService() {
+             ) {
+                 noisyPausedAt = 0L
+                 // ponytail: fixed 1.5s for the A2DP route to settle; tune if the first note leaks to the phone speaker
+-                scope.launch {
++                // Cancelled by any play meanwhile (a pause right after it is then the listener's last word).
++                reconnectResume = scope.launch {
+                     delay(1_500)
++                    // Dropped again inside the window: not on the phone's own loudspeaker.
++                    if (audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).none { it.isSink && it.type in RESUME_DEVICE_TYPES }) return@launch
+                     mediaSession?.player?.takeIf { !it.playWhenReady }?.play()
+                 }
+             }
+@@ -986,6 +992,7 @@ class PlaybackService : MediaLibraryService() {
+                 0L
+             }
+             lastPlayWhenReady = playWhenReady
++            if (playWhenReady) reconnectResume?.cancel()
+             // Something started the phone's own player while a receiver is the
+             // speaker — an internal path, since the session player's door
+             // already sends a listener's play to the receiver. The phone goes

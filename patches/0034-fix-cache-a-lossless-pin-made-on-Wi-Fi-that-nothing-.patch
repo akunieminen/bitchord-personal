@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 17:15:27 +0300
+Subject: [PATCH 34/61] fix(cache): a lossless pin made on Wi-Fi that nothing
+ has read yet is dropped on capped mobile data, so the cellular quality
+ ceiling holds for queued tracks too
+
+---
+ .../java/com/music/bitchord/playback/AudioCache.kt | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+index c1db7c6..1664914 100644
+--- a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
++++ b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+@@ -1466,9 +1466,19 @@ object AudioCache {
+      * there finished the file from another server's (two files, one decoder).
+      */
+     fun pinFor(id: String, spec: DataSpec): com.music.bitchord.data.sources.SourceStream? {
+-        StreamChoice.of(id)?.let { return it }
+-        if (!::cache.isInitialized) return null
++        if (!::cache.isInitialized) return StreamChoice.of(id)
+         val filler = fillerOf(spec.key ?: keyFactory.buildCacheKey(spec))
++        StreamChoice.of(id)?.let { pin ->
++            // A pin made on Wi-Fi that nothing has read yet is dropped once the connection's
++            // quality ceiling (or the Sources screen) no longer lets its source play: lossless
++            // read-ahead over capped mobile data otherwise.
++            val barred = pin.sourceConfigId?.let { cfg -> SourceRegistry.activeForPlayback().none { it.configId == cfg } }
++            if (filler == null && barred == true && StreamChoice.isSubstitute(id)) {
++                StreamChoice.forget(id)
++                return null
++            }
++            return pin
++        }
+         if (filler == null || filler == Origin.YOUTUBE.name) return null
+         return StreamChoice.lapsed(id)?.also { StreamChoice.remember(id, it, substituted = true) }
+     }

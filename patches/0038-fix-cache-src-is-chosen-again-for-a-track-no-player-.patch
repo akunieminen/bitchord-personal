@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 17:16:32 +0300
+Subject: [PATCH 38/61] fix(cache): #src is chosen again for a track no player
+ holds, so a replay later in the same session starts from the addon too, not
+ only after a restart
+
+---
+ app/src/main/java/com/music/bitchord/playback/AudioCache.kt | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+index e3a3ae8..7a7d613 100644
+--- a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
++++ b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+@@ -1101,6 +1101,9 @@ object AudioCache {
+      */
+     fun dropForeignEntries(keep: Set<String>) {
+         if (!::cache.isInitialized) return
++        // Fork: tracks no player holds choose #alt/#src afresh on their next play, so a
++        // replay in the same process sees the flag [recordServed] set after it was first keyed.
++        substituteKeys.keys.removeIf { it.substringBefore('#') !in keep }
+         scope.launch {
+             var dropped = 0
+             cache.keys.toList().forEach { key ->

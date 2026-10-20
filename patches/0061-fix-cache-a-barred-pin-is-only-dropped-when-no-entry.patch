@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 17:54:20 +0300
+Subject: [PATCH 61/61] =?UTF-8?q?fix(cache):=20a=20barred=20pin=20is=20onl?=
+ =?UTF-8?q?y=20dropped=20when=20no=20entry=20of=20the=20track=20holds=20su?=
+ =?UTF-8?q?bstitute=20bytes=20=E2=80=94=20the=20capped-data=20key=20move?=
+ =?UTF-8?q?=20#alt=20->=20plain=20made=20a=20playing=20FLAC's=20re-open=20?=
+ =?UTF-8?q?look=20unread=20and=20spliced=20YouTube=20into=20it?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ .../java/com/music/bitchord/playback/AudioCache.kt    | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+index 45e55ac..45513b9 100644
+--- a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
++++ b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+@@ -1493,9 +1493,11 @@ object AudioCache {
+         StreamChoice.of(id)?.let { pin ->
+             // A pin made on Wi-Fi that nothing has read yet is dropped once the connection's
+             // quality ceiling (or the Sources screen) no longer lets its source play: lossless
+-            // read-ahead over capped mobile data otherwise.
++            // read-ahead over capped mobile data otherwise. "Nothing" means no entry of the
++            // track: the same ceiling moves the key #alt -> plain, and a playing FLAC re-opened
++            // there must keep its pin.
+             val barred = pin.sourceConfigId?.let { cfg -> SourceRegistry.activeForPlayback().none { it.configId == cfg } }
+-            if (filler == null && barred == true && StreamChoice.isSubstitute(id)) {
++            if (barred == true && StreamChoice.isSubstitute(id) && !holdsSubstituteBytes(id)) {
+                 StreamChoice.forget(id)
+                 return null
+             }
+@@ -1514,6 +1516,11 @@ object AudioCache {
+     private fun fillerOf(key: String): String? =
+         runCatching { cache.getContentMetadata(key).get(META_ORIGIN, null as String?) }.getOrNull()
+ 
++    /** Fork: whether any entry of [id] holds (or is being filled with) a substitute's bytes. */
++    private fun holdsSubstituteBytes(id: String): Boolean =
++        listOf(id, "$id$ALT_SUFFIX", "$id$ALT_SUFFIX-noatmos", "$id#src", "$id#src-noatmos")
++            .any { key -> fillerOf(key).let { it != null && it != Origin.YOUTUBE.name } }
++
+     /** Fork: whether the entry [spec] reads already holds YouTube bytes; finishing it from another file splices two containers. */
+     fun holdsYouTubeBytes(spec: DataSpec): Boolean = ::cache.isInitialized && runCatching {
+         val key = spec.key ?: keyFactory.buildCacheKey(spec)

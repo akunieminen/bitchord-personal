@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 17:16:58 +0300
+Subject: [PATCH 41/61] fix(lookahead): the search top-result warm-up no longer
+ asks the addons, so a search can't re-pin a playing or read-ahead track to
+ another addon's file (splice) or add load to the rate-limited Qobuz addon
+
+---
+ .../com/music/bitchord/data/sources/SourceResolver.kt    | 9 ++++++---
+ .../main/java/com/music/bitchord/playback/AudioCache.kt  | 2 +-
+ 2 files changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/data/sources/SourceResolver.kt b/app/src/main/java/com/music/bitchord/data/sources/SourceResolver.kt
+index dac1a81..1651e4b 100644
+--- a/app/src/main/java/com/music/bitchord/data/sources/SourceResolver.kt
++++ b/app/src/main/java/com/music/bitchord/data/sources/SourceResolver.kt
+@@ -326,13 +326,16 @@ object SourceResolver {
+      * to YouTube, which is what the caller would have done anyway: nothing has
+      * been pinned, so the ordinary resolve at playback time is untouched.
+      */
+-    suspend fun prefetchSubstitute(target: TrackMatcher.Target): SourceStream? {
++    suspend fun prefetchSubstitute(target: TrackMatcher.Target, withAddons: Boolean = false): SourceStream? {
+         if (target.title.isBlank() || target.isVideo) return null
+         val active = SourceRegistry.activeForPlayback()
+         val youtube = active.firstOrNull { it.kind == SourceKind.YOUTUBE } ?: return null
+         val quick = rankedAbove(youtube.configId, active).filter {
+-            // Fork: addons too. Upstream keeps them out to spare shared servers a second lookup.
+-            it.kind.worthPrefetching || (it.kind == SourceKind.ADDON && ForkSettings.addonLookahead.value)
++            // Fork: addons too, for the queue's lookahead only (its pins are first-pin-wins).
++            // Upstream keeps them out to spare shared servers a second lookup, and the search
++            // top-result warm-up stays upstream's: it re-pins blindly, and a different addon's
++            // answer there finished a playing or read-ahead FLAC from another file.
++            it.kind.worthPrefetching || (withAddons && it.kind == SourceKind.ADDON && ForkSettings.addonLookahead.value)
+         }
+         if (quick.isEmpty()) return null
+         // Fork: no manifests — a pin is played from its first byte by a progressive source.
+diff --git a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+index ec1ee80..08327bb 100644
+--- a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
++++ b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+@@ -1459,7 +1459,7 @@ object AudioCache {
+             return false
+         }
+         val askedAt = SystemClock.elapsedRealtime()
+-        val stream = runCatching { SourceResolver.prefetchSubstitute(target) }
++        val stream = runCatching { SourceResolver.prefetchSubstitute(target, withAddons = true) }
+             .onFailure { TrackLog.d(TAG, "warm-up substitute failed for $id: ${it.message}", about = id) }
+             .getOrNull() ?: run {
+                 // Only a lookup that ran to the end is a miss; a cancelled one (the queue moved)

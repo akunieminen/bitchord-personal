@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: akunieminen <aku.nieminen1@gmail.com>
 Date: Tue, 20 Oct 2026 14:23:12 +0300
-Subject: [PATCH 27/29] fork: retry the next track's lookup (3 x 20s) when
+Subject: [PATCH 27/61] fork: retry the next track's lookup (3 x 20s) when
  addon trouble spoiled it
 
 ---

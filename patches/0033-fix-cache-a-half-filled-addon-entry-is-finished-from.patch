@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 17:15:07 +0300
+Subject: [PATCH 33/61] fix(cache): a half-filled addon entry is finished from
+ its own stream after its 15-min pin lapses (pause, long tracks), not from a
+ fresh race that can splice another file in
+
+---
+ .../com/music/bitchord/playback/AudioCache.kt | 25 ++++++++++++++++++-
+ .../bitchord/playback/PlaybackService.kt      |  3 ++-
+ .../music/bitchord/playback/StreamChoice.kt   | 15 +++++++----
+ 3 files changed, 36 insertions(+), 7 deletions(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+index 0de92fb..c1db7c6 100644
+--- a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
++++ b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+@@ -1422,7 +1422,7 @@ object AudioCache {
+         if (StreamChoice.substitutesRefused(id)) return false
+         // Nor is a track the quick sources just didn't have asked about again on every queue change.
+         if (recentlyMissed(id)) return false
+-        StreamChoice.of(id)?.let { pinned ->
++        pinFor(id, DataSpec(Uri.parse("bitchord://watch?v=$id")))?.let { pinned ->
+             if (!StreamChoice.isSubstitute(id)) return false
+             // Re-stamped, so a pin made a track early doesn't age out before
+             // its own fade arms. Ceiling: the URL is then trusted up to a track
+@@ -1459,6 +1459,29 @@ object AudioCache {
+         return true
+     }
+ 
++    /**
++     * Fork: the pin a resolve or read-ahead of [id] must honour, for the entry [spec] reads.
++     * A substitute's pin outlives [StreamChoice]'s TTL while that entry holds (or is filling
++     * with) a substitute's bytes — a long pause or two long tracks age it out, and a fresh race
++     * there finished the file from another server's (two files, one decoder).
++     */
++    fun pinFor(id: String, spec: DataSpec): com.music.bitchord.data.sources.SourceStream? {
++        StreamChoice.of(id)?.let { return it }
++        if (!::cache.isInitialized) return null
++        val filler = fillerOf(spec.key ?: keyFactory.buildCacheKey(spec))
++        if (filler == null || filler == Origin.YOUTUBE.name) return null
++        return StreamChoice.lapsed(id)?.also { StreamChoice.remember(id, it, substituted = true) }
++    }
++
++    /**
++     * Fork: whose bytes the entry [key] holds or is being filled with, or null when it is empty.
++     * Read from the tag [recordServed] writes before the first byte: an entry's first 5 MB
++     * fragment is not a span until it is committed, so a span check sees a track still being
++     * streamed into it as empty.
++     */
++    private fun fillerOf(key: String): String? =
++        runCatching { cache.getContentMetadata(key).get(META_ORIGIN, null as String?) }.getOrNull()
++
+     /** Fork: whether the entry [spec] reads already holds YouTube bytes; finishing it from another file splices two containers. */
+     fun holdsYouTubeBytes(spec: DataSpec): Boolean = ::cache.isInitialized && runCatching {
+         val key = spec.key ?: keyFactory.buildCacheKey(spec)
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index 589c564..25d7052 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -1542,7 +1542,8 @@ class PlaybackService : MediaLibraryService() {
+             // [StreamChoice].
+             // Fork: an entry already holding YouTube bytes is finished from YouTube, pinned or not.
+             val youTubeOnDisk = AudioCache.holdsYouTubeBytes(dataSpec)
+-            StreamChoice.of(videoId)?.takeUnless { youTubeOnDisk && StreamChoice.isSubstitute(videoId) }?.let { serving ->
++            // Fork: and a half-filled substitute's entry from its own stream, its pin lapsed or not.
++            AudioCache.pinFor(videoId, dataSpec)?.takeUnless { youTubeOnDisk && StreamChoice.isSubstitute(videoId) }?.let { serving ->
+                 // What the stream claims to be, restated on every open rather
+                 // than only on the one that chose it.
+                 //
+diff --git a/app/src/main/java/com/music/bitchord/playback/StreamChoice.kt b/app/src/main/java/com/music/bitchord/playback/StreamChoice.kt
+index 70f3188..5699e58 100644
+--- a/app/src/main/java/com/music/bitchord/playback/StreamChoice.kt
++++ b/app/src/main/java/com/music/bitchord/playback/StreamChoice.kt
+@@ -60,13 +60,18 @@ object StreamChoice {
+      */
+     fun of(videoId: String): SourceStream? {
+         val choice = chosen[videoId] ?: return null
+-        if (SystemClock.elapsedRealtime() - choice.at > TTL_MS) {
+-            chosen.remove(videoId)
+-            return null
+-        }
+-        return choice.stream
++        // Fork: an expired choice is kept (bounded by [remember]'s pruning), see [lapsed].
++        return choice.stream.takeIf { SystemClock.elapsedRealtime() - choice.at <= TTL_MS }
+     }
+ 
++    /**
++     * Fork: the substitute last chosen for [videoId], however long ago. Only for
++     * finishing an entry that stream already started filling: a fresh race there
++     * after a long pause could append another server's file. A URL that died in
++     * the meantime fails as a 403 into recovery instead of splicing.
++     */
++    fun lapsed(videoId: String): SourceStream? = chosen[videoId]?.takeIf { it.substituted }?.stream
++
+     /**
+      * Records [stream] as the one copy of [videoId] this play is reading.
+      *

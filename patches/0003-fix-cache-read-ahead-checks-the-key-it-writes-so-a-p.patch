@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: akunieminen <aku.nieminen1@gmail.com>
 Date: Tue, 20 Oct 2026 10:27:17 +0300
-Subject: [PATCH 03/29] fix(cache): read-ahead checks the key it writes, so a
+Subject: [PATCH 03/61] fix(cache): read-ahead checks the key it writes, so a
  pinned substitute is cached past its 64kB probe
 
 ---

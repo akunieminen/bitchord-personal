@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 17:20:58 +0300
+Subject: [PATCH 56/61] fix(automix): a kept mix tempo is reset when a skip or
+ a new queue cuts a blend short, instead of leaking onto the track skipped to
+
+---
+ .../music/bitchord/playback/CrossfadeController.kt    | 11 ++++++-----
+ 1 file changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
+index f322c19..e6dd826 100644
+--- a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
++++ b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
+@@ -642,11 +642,6 @@ class CrossfadeController(
+         }
+ 
+         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+-            // Fork: a tempo kept from the last mix ends with its track.
+-            listeningTo?.takeIf { phase == Phase.IDLE && easing == null }?.let { player ->
+-                val normal = AppSettings.playbackSpeed.value
+-                if (abs(player.playbackParameters.speed - normal) >= SPEED_CHANGE_EPSILON) player.setPlaybackSpeed(normal)
+-            }
+             when (reason) {
+                 // Something replaced the queue out from under the fade — a new
+                 // album, a new search result — so the tail still playing is a
+@@ -657,6 +652,12 @@ class CrossfadeController(
+                 Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED -> bail()
+                 Player.MEDIA_ITEM_TRANSITION_REASON_SEEK -> bail()
+             }
++            // Fork: a tempo kept from the last mix ends with its track — also when a skip or a
++            // new queue cut a blend short (bailing by then), or the skipped-to track keeps it.
++            listeningTo?.takeIf { (phase == Phase.IDLE || phase == Phase.BAILING) && easing == null }?.let { player ->
++                val normal = AppSettings.playbackSpeed.value
++                if (abs(player.playbackParameters.speed - normal) >= SPEED_CHANGE_EPSILON) player.setPlaybackSpeed(normal)
++            }
+         }
+ 
+         override fun onPlayerError(error: PlaybackException) = bail()

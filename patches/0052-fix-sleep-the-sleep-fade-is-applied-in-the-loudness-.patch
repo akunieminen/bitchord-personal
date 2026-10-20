@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 17:19:09 +0300
+Subject: [PATCH 52/61] fix(sleep): the sleep fade is applied in the loudness
+ stage of both players, so a crossfade or upgrade swap in its last 15s can't
+ swell the music back up, flutter or snap
+
+---
+ .../bitchord/playback/PlaybackService.kt      | 22 ++++++++++++++-----
+ 1 file changed, 16 insertions(+), 6 deletions(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index 4504fa8..b7e4afc 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -6660,8 +6660,7 @@ class PlaybackService : MediaLibraryService() {
+                     while (true) {
+                         val left = deadline - SystemClock.elapsedRealtime()
+                         if (left <= 0) break
+-                        // ponytail: re-applied every tick, so a player swap mid-fade is overridden within 200ms
+-                        player?.volume = (left.toFloat() / SleepTimer.FADE_MS).coerceIn(0f, 1f)
++                        sleepGain = (left.toFloat() / SleepTimer.FADE_MS).coerceIn(0f, 1f)
+                         delay(minOf(left, 200L))
+                     }
+                     player?.pause()
+@@ -6669,7 +6668,7 @@ class PlaybackService : MediaLibraryService() {
+                     // Fork: a sleep-timer pause stops read-ahead; a user pause keeps it (see onIsPlayingChanged).
+                     cancelPrefetch()
+                 } finally {
+-                    player?.volume = 1f
++                    sleepGain = 1f
+                 }
+             }
+         }
+@@ -7339,9 +7338,20 @@ class PlaybackService : MediaLibraryService() {
+      * the YouTube stream alongside the substitute lookup rather than only when
+      * one fails — see [StreamResolver.loudnessDbFor]'s own doc.
+      */
+-    private fun loudnessGainFor(mediaId: String): Float = loudnessGainMb(mediaId)
+-        ?.let { 10.0.pow(it / 2000.0).toFloat() }
+-        ?: 1f
++    private fun loudnessGainFor(mediaId: String): Float = (
++        loudnessGainMb(mediaId)
++            ?.let { 10.0.pow(it / 2000.0).toFloat() }
++            ?: 1f
++        ) * sleepGain
++
++    /**
++     * Fork: the sleep timer's fade, applied in both players' loudness stages rather than on
++     * `player.volume`, which the crossfade and the upgrade/version swaps also write (a blend
++     * in the fade's window swelled back to full volume, fluttered, then dropped).
++     * ponytail: PCM only; a passthrough/offload (Atmos) track isn't faded.
++     */
++    @Volatile
++    private var sleepGain = 1f
+ 
+     private fun loudnessGainMb(mediaId: String?): Int? {
+         if (!AppSettings.loudnessNormalization.value) return null

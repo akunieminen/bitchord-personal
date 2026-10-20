@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 17:22:32 +0300
+Subject: [PATCH 60/61] fork: keep upstream's kotlinx.coroutines.job import in
+ AudioCache, so an upstream release that uses .job there again still compiles
+ after a clean rebase
+
+---
+ app/src/main/java/com/music/bitchord/playback/AudioCache.kt | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+index 08327bb..45e55ac 100644
+--- a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
++++ b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+@@ -45,6 +45,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.StateFlow
+ import kotlinx.coroutines.flow.asStateFlow
+ import kotlinx.coroutines.isActive
++import kotlinx.coroutines.job
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.withContext
+ import okhttp3.Request

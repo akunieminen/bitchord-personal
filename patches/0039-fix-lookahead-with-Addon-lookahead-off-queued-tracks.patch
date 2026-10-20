@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 17:16:42 +0300
+Subject: [PATCH 39/61] fix(lookahead): with Addon lookahead off, queued tracks
+ are no longer booked as addon misses, which silently switched off their head
+ start too
+
+---
+ app/src/main/java/com/music/bitchord/playback/AudioCache.kt | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+index 7a7d613..ec1ee80 100644
+--- a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
++++ b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+@@ -1463,8 +1463,9 @@ object AudioCache {
+             .onFailure { TrackLog.d(TAG, "warm-up substitute failed for $id: ${it.message}", about = id) }
+             .getOrNull() ?: run {
+                 // Only a lookup that ran to the end is a miss; a cancelled one (the queue moved)
+-                // is not, nor one during which an addon was rate limiting or failing.
+-                if (coroutineContext.isActive &&
++                // is not, nor one during which an addon was rate limiting or failing, nor one that
++                // asked no addon at all (lookahead off) — a miss also costs the track its head start.
++                if (coroutineContext.isActive && ForkSettings.addonLookahead.value &&
+                     com.music.bitchord.data.sources.addon.AddonClient.lastTroubleAtMs < askedAt
+                 ) {
+                     pinMisses[id] = SystemClock.elapsedRealtime()

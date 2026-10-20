@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 17:16:47 +0300
+Subject: [PATCH 40/61] fix(addon): a response cut off mid-body, a blank 200 or
+ an undecodable one counts as addon trouble, so it isn't remembered as a
+ 10-min miss
+
+---
+ .../java/com/music/bitchord/data/sources/addon/AddonClient.kt   | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/app/src/main/java/com/music/bitchord/data/sources/addon/AddonClient.kt b/app/src/main/java/com/music/bitchord/data/sources/addon/AddonClient.kt
+index 1b45a0c..1931f50 100644
+--- a/app/src/main/java/com/music/bitchord/data/sources/addon/AddonClient.kt
++++ b/app/src/main/java/com/music/bitchord/data/sources/addon/AddonClient.kt
+@@ -310,6 +310,8 @@ class AddonClient(rawBaseUrl: String) {
+                 // A miss is not worth a line. Everything else is: this is the
+                 // only place that knows why an addon didn't answer.
+                 if (failure !is AddonNotFound) {
++                    // Fork: also a body cut off mid-read, a blank or an undecodable 200 — see lastTroubleAtMs.
++                    lastTroubleAtMs = android.os.SystemClock.elapsedRealtime()
+                     TrackLog.w(TAG, "  ✗ addon call failed ${redact(url)}: ${failure.message}")
+                 }
+             }

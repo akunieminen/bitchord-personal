@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: akunieminen <aku.nieminen1@gmail.com>
 Date: Tue, 20 Oct 2026 13:51:49 +0300
-Subject: [PATCH 25/29] fork: a track whose #alt holds a kept YouTube copy gets
+Subject: [PATCH 25/61] fork: a track whose #alt holds a kept YouTube copy gets
  a fresh #src entry, so replays start from the addon instead of upgrading
  mid-song
 
