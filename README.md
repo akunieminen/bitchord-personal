@@ -44,5 +44,9 @@ Fork settings live under **Settings → Fork tweaks**.
 | no swap after a mix | a song that crossfaded in keeps its stream for that play |
 | keep mix tempo | after a beat-matched Automix the song keeps the matched speed instead of a stop-inducing reset |
 | review fixes | no FLAC spliced onto a cached YouTube prefix; read-ahead probes the first missing byte |
+| AutoPlay | queue length setting (default 25); scrolling near the end loads more |
+| fewer lookups | addon misses remembered 10 min; sleep timer stops read-ahead; resume re-runs it |
+| EQ sessions | each player keeps its own audio session, both advertised, so Wavelet-style EQs don't re-attach at crossfades |
+| QOL | Bluetooth reconnect resumes; unplayable-skip toast; sleep timer fade + 5/10 min; source on the stats line |
 | PR #932 + fixes | 300 ms crossfade instead of a cut when an upgrade still happens |
 | updater / version / logs | updates from this repo, `.N` version suffix, TrackLog in logcat |

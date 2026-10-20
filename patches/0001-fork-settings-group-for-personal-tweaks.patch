@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: akunieminen <aku.nieminen1@gmail.com>
 Date: Tue, 20 Oct 2026 10:25:02 +0300
-Subject: [PATCH 01/16] fork: settings group for personal tweaks
+Subject: [PATCH 01/22] fork: settings group for personal tweaks
 
 ---
  .../com/music/bitchord/BitChordApplication.kt |  1 +

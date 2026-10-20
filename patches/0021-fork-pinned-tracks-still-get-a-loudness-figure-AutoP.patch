@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 12:01:27 +0300
+Subject: [PATCH 21/22] fork: pinned tracks still get a loudness figure;
+ AutoPlay de-dup off the main thread
+
+---
+ .../java/com/music/bitchord/playback/AudioCache.kt     |  4 +++-
+ .../main/java/com/music/bitchord/playback/Autoplay.kt  |  5 ++++-
+ .../com/music/bitchord/playback/PlaybackService.kt     | 10 +++++++---
+ 3 files changed, 14 insertions(+), 5 deletions(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+index c5b2c5a..38d92f8 100644
+--- a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
++++ b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+@@ -1327,7 +1327,9 @@ object AudioCache {
+                         // for a YouTube URL: nothing will ask for one, and
+                         // minting it spends a client walk to fill a cache entry
+                         // that is never read.
+-                        if ((id == next && warmed) || StreamChoice.isSubstitute(id)) continue
++                        // The YouTube lookup is also where a track's loudness figure comes from,
++                        // so a pinned track still gets one while normalization is on.
++                        if ((id == next && warmed) || (StreamChoice.isSubstitute(id) && !AppSettings.loudnessNormalization.value)) continue
+                         runCatching { StreamResolver.resolve(id) }
+                             .onFailure { TrackLog.d(TAG, "queue warm-up skipped $id: ${it.message}", about = id) }
+                         delay(QUEUE_RESOLVE_STAGGER_MS)
+diff --git a/app/src/main/java/com/music/bitchord/playback/Autoplay.kt b/app/src/main/java/com/music/bitchord/playback/Autoplay.kt
+index 48f95f8..ff3ee7c 100644
+--- a/app/src/main/java/com/music/bitchord/playback/Autoplay.kt
++++ b/app/src/main/java/com/music/bitchord/playback/Autoplay.kt
+@@ -11,6 +11,8 @@ import com.music.bitchord.data.sources.SourceRegistry
+ import com.music.bitchord.data.sources.TrackMatcher
+ import com.music.bitchord.playback.QueueCoordinator.asQueueEntry
+ import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
+ 
+ /** Most AutoPlay-suggested tracks kept queued ahead of the current one at once. Fork: a setting; upstream's is 10. */
+ // A party keeps upstream's 10: its server refuses a queue past its own upcoming limit.
+@@ -105,7 +107,8 @@ suspend fun loadAutoplayTracks(
+ ): Result<List<Song>> {
+     val seed = youtubeSeedFor(seedSong) ?: return Result.success(emptyList())
+     val related = YtMusicRepository.radio(seed).getOrElse { return Result.failure(it) }
+-    val extra = QueueBuilder.extend(existing, related, limit)
++    // Fork: off the main thread — against a few hundred queued tracks the de-dup froze the UI.
++    val extra = withContext(Dispatchers.Default) { QueueBuilder.extend(existing, related, limit) }
+     if (extra.isEmpty()) return Result.success(emptyList())
+ 
+     return Result.success(extra.map {
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index bb7696d..558cd2a 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -2968,10 +2968,14 @@ class PlaybackService : MediaLibraryService() {
+                 TrackLog.w("BitChord", "more AutoPlay failed: ${it.message}", about = seed.videoId)
+                 return@launch
+             }
++            val now = player?.let { p -> (0 until p.mediaItemCount).map { p.getMediaItemAt(it).toSong() } } ?: return@launch
++            val (fresh, items) = withContext(Dispatchers.Default) {
++                val f = more.filterNot { song -> now.any { QueueBuilder.isSameRecording(it, song) } }
++                f to f.map { it.toMediaItem() }
++            }
++            // A source crossfade may have swapped players meanwhile.
+             val latest = player ?: return@launch
+-            val now = (0 until latest.mediaItemCount).map { latest.getMediaItemAt(it).toSong() }
+-            val fresh = more.filterNot { song -> now.any { QueueBuilder.isSameRecording(it, song) } }
+-            if (fresh.isNotEmpty()) latest.addMediaItems(fresh.map { it.toMediaItem() })
++            if (items.isNotEmpty()) latest.addMediaItems(items)
+             if (AppSettings.dontRepeatSuggestions.value) sessionSongHistory += fresh
+             TrackLog.d("BitChord", "AutoPlay extended by ${fresh.size} from '${seed.title}'", about = seed.videoId)
+         }

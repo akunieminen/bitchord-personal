@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: akunieminen <aku.nieminen1@gmail.com>
 Date: Tue, 20 Oct 2026 10:22:46 +0300
-Subject: [PATCH 09/16] fork: fix PR 932 correctness
+Subject: [PATCH 09/22] fork: fix PR 932 correctness
 
 ---
  .../bitchord/playback/PlaybackService.kt      | 96 ++++++++++++++-----

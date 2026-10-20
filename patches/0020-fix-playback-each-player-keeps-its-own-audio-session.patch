@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 11:58:44 +0300
+Subject: [PATCH 20/22] fix(playback): each player keeps its own audio session
+ and both are advertised to effect apps, so EQs (Wavelet) stay attached
+ through crossfades
+
+---
+ .../bitchord/playback/PlaybackService.kt      | 68 +++++++++++++------
+ 1 file changed, 46 insertions(+), 22 deletions(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index 572e05d..bb7696d 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -609,7 +609,11 @@ class PlaybackService : MediaLibraryService() {
+     private var loudnessRetryJob: Job? = null
+ 
+     /** The platform audio session currently advertised to system audio tools. */
+-    private var advertisedAudioEffectSessionId: Int = C.AUDIO_SESSION_ID_UNSET
++    private var advertisedAudioEffectSessions: Set<Int> = emptySet()
++
++    /** Fork: each player's own, fixed audio session — see where they are assigned. */
++    private var sessionA = C.AUDIO_SESSION_ID_UNSET
++    private var sessionB = C.AUDIO_SESSION_ID_UNSET
+ 
+     /**
+      * Whether the format currently arriving at the active player's decoder
+@@ -1700,7 +1704,17 @@ class PlaybackService : MediaLibraryService() {
+         // other effect attached to the app applies to whichever player happens
+         // to be audible. Without it a crossfade would audibly change EQ halfway
+         // through, and again at every handoff.
+-        sparePlayer.audioSessionId = exoPlayer.audioSessionId
++        //
++        // Fork: that copy was a no-op — Media3 1.11 assigns ids on a background
++        // thread, so both read UNSET here and each player got its own session
++        // anyway. A shared one is worse with a volume-controller effect (Wavelet's
++        // DynamicsProcessing): it applies one track's volume to the whole session,
++        // so both tracks faded together. Each player keeps its own fixed session
++        // instead, and both are advertised — see [updateAudioEffectSession].
++        sessionA = androidx.media3.common.util.Util.generateAudioSessionId(this)
++        sessionB = androidx.media3.common.util.Util.generateAudioSessionId(this)
++        exoPlayer.audioSessionId = sessionA
++        sparePlayer.audioSessionId = sessionB
+         audioManager?.registerAudioDeviceCallback(outputDeviceCallback, null)
+         applyOutputRoute()
+ 
+@@ -3357,30 +3371,37 @@ class PlaybackService : MediaLibraryService() {
+             closeAudioEffectSession()
+             return
+         }
+-        if (advertisedAudioEffectSessionId == sessionId) return
++        // Fork: both players' sessions, so an effect app attaches to each once and
++        // stays attached through every crossfade handoff instead of re-attaching.
++        val sessions = setOfNotNull(sessionId, spare?.audioSessionId).filter { it > 0 }.toSet()
++        if (advertisedAudioEffectSessions == sessions) return
+ 
+         closeAudioEffectSession()
+-        advertisedAudioEffectSessionId = sessionId
+-        sendBroadcast(
+-            Intent(AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION).apply {
+-                putExtra(AudioEffect.EXTRA_AUDIO_SESSION, sessionId)
+-                putExtra(AudioEffect.EXTRA_PACKAGE_NAME, packageName)
+-                putExtra(AudioEffect.EXTRA_CONTENT_TYPE, AudioEffect.CONTENT_TYPE_MUSIC)
+-            },
+-        )
++        advertisedAudioEffectSessions = sessions
++        sessions.forEach { id ->
++            sendBroadcast(
++                Intent(AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION).apply {
++                    putExtra(AudioEffect.EXTRA_AUDIO_SESSION, id)
++                    putExtra(AudioEffect.EXTRA_PACKAGE_NAME, packageName)
++                    putExtra(AudioEffect.EXTRA_CONTENT_TYPE, AudioEffect.CONTENT_TYPE_MUSIC)
++                },
++            )
++        }
+     }
+ 
+     private fun closeAudioEffectSession() {
+-        val sessionId = advertisedAudioEffectSessionId
+-        if (sessionId == C.AUDIO_SESSION_ID_UNSET) return
+-
+-        advertisedAudioEffectSessionId = C.AUDIO_SESSION_ID_UNSET
+-        sendBroadcast(
+-            Intent(AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION).apply {
+-                putExtra(AudioEffect.EXTRA_AUDIO_SESSION, sessionId)
+-                putExtra(AudioEffect.EXTRA_PACKAGE_NAME, packageName)
+-            },
+-        )
++        val sessions = advertisedAudioEffectSessions
++        if (sessions.isEmpty()) return
++
++        advertisedAudioEffectSessions = emptySet()
++        sessions.forEach { id ->
++            sendBroadcast(
++                Intent(AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION).apply {
++                    putExtra(AudioEffect.EXTRA_AUDIO_SESSION, id)
++                    putExtra(AudioEffect.EXTRA_PACKAGE_NAME, packageName)
++                },
++            )
++        }
+     }
+ 
+     /**
+@@ -6912,7 +6933,10 @@ class PlaybackService : MediaLibraryService() {
+         )
+         player = newActive
+         spare = newSpare
+-        newSpare.audioSessionId = newActive.audioSessionId
++        // Fork: the same two sessions, so attached effects survive the rebuild.
++        val keep = oldActive.audioSessionId
++        newActive.audioSessionId = keep
++        newSpare.audioSessionId = if (keep == sessionA) sessionB else sessionA
+         AppSettings.audioSessionId.value = newActive.audioSessionId
+         applySettings(newActive)
+         applySettings(newSpare)

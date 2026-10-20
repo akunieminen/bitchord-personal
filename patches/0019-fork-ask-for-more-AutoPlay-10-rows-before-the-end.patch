@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 11:29:28 +0300
+Subject: [PATCH 19/22] fork: ask for more AutoPlay 10 rows before the end
+
+---
+ .../kotlin/com/music/bitchord/ui/player/PlayerQueue.kt       | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/PlayerQueue.kt b/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/PlayerQueue.kt
+index 0996494..d43a771 100644
+--- a/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/PlayerQueue.kt
++++ b/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/PlayerQueue.kt
+@@ -242,12 +242,13 @@ internal fun InlineQueue(
+         snapshotFlow { listState.isScrollInProgress }.collect(onScrollingChange)
+     }
+     val keepScroll = remember(listState) { keepScrollInList(listState) }
+-    // Fork: reaching the last rows asks for more AutoPlay, once per arrival.
++    // Fork: nearing the last rows asks for more AutoPlay, once per arrival — 10 rows
++    // early, so the batch usually lands before the list runs out under the thumb.
+     LaunchedEffect(listState, autoplayEnabled, controlsLocked) {
+         if (!autoplayEnabled || controlsLocked) return@LaunchedEffect
+         snapshotFlow {
+             val info = listState.layoutInfo
+-            info.totalItemsCount > 0 && (info.visibleItemsInfo.lastOrNull()?.index ?: -1) >= info.totalItemsCount - 3
++            info.totalItemsCount > 0 && (info.visibleItemsInfo.lastOrNull()?.index ?: -1) >= info.totalItemsCount - 10
+         }.distinctUntilChanged().filter { it }.collect { QueueEndHook.onNearEnd() }
+     }
+     val controlsOnScroll = rememberPlayerControlsOnScroll(

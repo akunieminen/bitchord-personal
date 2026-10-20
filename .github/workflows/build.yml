@@ -92,10 +92,11 @@ jobs:
           touch local.properties
 
       - name: Build
+        # Revisions start at 100 so CI builds always outrank local test builds (1.8.1.1-99).
         run: |
           chmod +x gradlew
           ./gradlew --console=plain :app:assembleProdRelease \
-            -Pbitchord.forkRevision=${{ github.run_number }} -Pbitchord.bundleWear=false
+            -Pbitchord.forkRevision=$((100 + ${{ github.run_number }})) -Pbitchord.bundleWear=false
 
       - name: Publish
         run: |

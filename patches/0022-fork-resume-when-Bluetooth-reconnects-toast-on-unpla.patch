@@ -1,0 +1,211 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 12:02:23 +0300
+Subject: [PATCH 22/22] fork: resume when Bluetooth reconnects, toast on
+ unplayable skips, sleep timer fades out (+5/10 min), source name on the stats
+ line
+
+---
+ .../bitchord/data/settings/ForkSettings.kt    |  5 +-
+ .../bitchord/playback/PlaybackService.kt      | 67 +++++++++++++++++--
+ .../com/music/bitchord/playback/SleepTimer.kt |  5 +-
+ .../bitchord/ui/screens/ForkTweaksGroup.kt    |  8 +++
+ .../bitchord/ui/player/PlayerControls.kt      |  4 +-
+ 5 files changed, 79 insertions(+), 10 deletions(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/data/settings/ForkSettings.kt b/app/src/main/java/com/music/bitchord/data/settings/ForkSettings.kt
+index fa7ff11..985b242 100644
+--- a/app/src/main/java/com/music/bitchord/data/settings/ForkSettings.kt
++++ b/app/src/main/java/com/music/bitchord/data/settings/ForkSettings.kt
+@@ -44,6 +44,9 @@ object ForkSettings {
+     /** After a beat-matched mix the incoming track keeps the matched speed until it ends, instead of snapping back. */
+     val keepMixTempo = Toggle("keep_mix_tempo", true)
+ 
++    /** Music a Bluetooth disconnect paused resumes when that output comes back within 10 min. */
++    val resumeOnReconnect = Toggle("resume_on_reconnect", true)
++
+     /**
+      * How long an unpinned track waits for a higher-ranked source before
+      * taking YouTube's stream. 0 is upstream's plain race.
+@@ -65,7 +68,7 @@ object ForkSettings {
+ 
+     fun init(context: Context) {
+         prefs = context.getSharedPreferences("bitchord_fork", Context.MODE_PRIVATE)
+-        listOf(addonLookahead, pinTwoAhead, fastReadAhead, prefetchWhilePaused, noUpgradeAfterBlend, keepMixTempo)
++        listOf(addonLookahead, pinTwoAhead, fastReadAhead, prefetchWhilePaused, noUpgradeAfterBlend, keepMixTempo, resumeOnReconnect)
+             .forEach { it.load() }
+         headStartMs.value = prefs.getLong(KEY_HEAD_START_MS, DEFAULT_HEAD_START_MS)
+         autoplayLength.value = prefs.getInt(KEY_AUTOPLAY_LENGTH, DEFAULT_AUTOPLAY_LENGTH)
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index 558cd2a..642be03 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -535,6 +535,9 @@ class PlaybackService : MediaLibraryService() {
+     private val audioManager by lazy { getSystemService(AudioManager::class.java) }
+     private val bluetoothTracker by lazy { BluetoothAudioTracker(this) }
+     private var currentAudioInputFormat: Format? = null
++    /** Fork: when a disconnecting output (AUDIO_BECOMING_NOISY) paused playback, or 0. */
++    private var noisyPausedAt = 0L
++
+     private val outputDeviceCallback = object : AudioDeviceCallback() {
+         override fun onAudioDevicesAdded(addedDevices: Array<AudioDeviceInfo>) {
+             // Plugging something in moves the music to it. Always — a choice
+@@ -544,6 +547,20 @@ class PlaybackService : MediaLibraryService() {
+             // would be a picker that had quietly broken the obvious behaviour.
+             AudioRouting.forget()
+             requestOutputReconfiguration()
++            // Fork: the Bluetooth speaker that just dropped out is back within the
++            // foreground window, so the music it paused carries on.
++            val pausedAt = noisyPausedAt
++            if (ForkSettings.resumeOnReconnect.value && pausedAt != 0L &&
++                SystemClock.elapsedRealtime() - pausedAt < DEFAULT_FOREGROUND_SERVICE_TIMEOUT_MS &&
++                addedDevices.any { it.isSink && it.type in RESUME_DEVICE_TYPES }
++            ) {
++                noisyPausedAt = 0L
++                // ponytail: fixed 1.5s for the A2DP route to settle; tune if the first note leaks to the phone speaker
++                scope.launch {
++                    delay(1_500)
++                    mediaSession?.player?.takeIf { !it.playWhenReady }?.play()
++                }
++            }
+         }
+         override fun onAudioDevicesRemoved(removedDevices: Array<AudioDeviceInfo>) {
+             // A chosen output that has been unplugged is no longer a choice.
+@@ -955,6 +972,12 @@ class PlaybackService : MediaLibraryService() {
+          * on the audio, which is what the media notification shows too.
+          */
+         override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
++            // Fork: remembered for resume-on-reconnect; any other change forgets it.
++            noisyPausedAt = if (!playWhenReady && reason == Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_BECOMING_NOISY) {
++                SystemClock.elapsedRealtime()
++            } else {
++                0L
++            }
+             // Something started the phone's own player while a receiver is the
+             // speaker — an internal path, since the session player's door
+             // already sends a listener's play to the receiver. The phone goes
+@@ -4271,10 +4294,21 @@ class PlaybackService : MediaLibraryService() {
+      * `rememberPlayerState` in
+      * [PlayerConnection][com.music.bitchord.playback.PlayerConnection].
+      */
++    private var unplayableToast: Toast? = null
++
+     private fun skipPastUnplayable(mediaId: String, reason: String) {
+         val exoPlayer = player ?: return
+         if (exoPlayer.currentMediaItem?.mediaId != mediaId) return
+-        if (!exoPlayer.hasNextMediaItem()) {
++        // Fork: say so, rather than a song silently vanishing from under the listener.
++        val title = exoPlayer.currentMediaItem?.mediaMetadata?.title ?: "this track"
++        val hasNext = exoPlayer.hasNextMediaItem()
++        unplayableToast?.cancel()
++        unplayableToast = Toast.makeText(
++            applicationContext,
++            if (hasNext) "Couldn't play “$title” — skipped" else "Couldn't play “$title”",
++            Toast.LENGTH_SHORT,
++        ).also { it.show() }
++        if (!hasNext) {
+             TrackLog.w("BitChord", "$reason — and nothing after it in the queue", about = mediaId)
+             return
+         }
+@@ -6487,12 +6521,24 @@ class PlaybackService : MediaLibraryService() {
+         scope.launch {
+             SleepTimer.deadline.collectLatest { deadline ->
+                 if (deadline == null) return@collectLatest
+-                val remaining = deadline - SystemClock.elapsedRealtime()
+-                if (remaining > 0) delay(remaining)
+-                player?.pause()
+-                SleepTimer.cancel()
+-                // Fork: a sleep-timer pause stops read-ahead; a user pause keeps it (see onIsPlayingChanged).
+-                cancelPrefetch()
++                // Fork: the last 15s fade out instead of a dead stop mid-song. An extended or
++                // cancelled timer cancels this block, and finally puts the volume back.
++                delay(deadline - SleepTimer.FADE_MS - SystemClock.elapsedRealtime())
++                try {
++                    while (true) {
++                        val left = deadline - SystemClock.elapsedRealtime()
++                        if (left <= 0) break
++                        // ponytail: re-applied every tick, so a player swap mid-fade is overridden within 200ms
++                        player?.volume = (left.toFloat() / SleepTimer.FADE_MS).coerceIn(0f, 1f)
++                        delay(minOf(left, 200L))
++                    }
++                    player?.pause()
++                    SleepTimer.cancel()
++                    // Fork: a sleep-timer pause stops read-ahead; a user pause keeps it (see onIsPlayingChanged).
++                    cancelPrefetch()
++                } finally {
++                    player?.volume = 1f
++                }
+             }
+         }
+     }
+@@ -9392,6 +9438,13 @@ class PlaybackService : MediaLibraryService() {
+         /** One fresh request is the fallback; normal track/queue changes re-arm it. */
+         const val MAX_AUTOPLAY_EMPTY_REFRESHES = 1
+ 
++        /** Fork: outputs whose return resumes music a disconnect paused. */
++        val RESUME_DEVICE_TYPES = setOf(
++            AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
++            AudioDeviceInfo.TYPE_BLE_SPEAKER,
++            AudioDeviceInfo.TYPE_BLE_HEADSET,
++        )
++
+         /**
+          * How long AutoPlay waits for the party to echo back the tracks it just
+          * sent, before assuming they were refused.
+diff --git a/app/src/main/java/com/music/bitchord/playback/SleepTimer.kt b/app/src/main/java/com/music/bitchord/playback/SleepTimer.kt
+index d3e164e..dd262b0 100644
+--- a/app/src/main/java/com/music/bitchord/playback/SleepTimer.kt
++++ b/app/src/main/java/com/music/bitchord/playback/SleepTimer.kt
+@@ -30,7 +30,10 @@ object SleepTimer {
+     val afterTrack = MutableStateFlow(false)
+ 
+     /** Durations offered in the picker. */
+-    val PRESETS = listOf(15, 30, 45, 60)
++    val PRESETS = listOf(5, 10, 15, 30, 45, 60) // fork: + 5 and 10
++
++    /** Fork: how long before the deadline the music starts fading out. */
++    const val FADE_MS = 15_000L
+ 
+     /** Whether any kind of timer is currently armed. */
+     val isRunning: Boolean get() = deadline.value != null || afterTrack.value
+diff --git a/app/src/main/java/com/music/bitchord/ui/screens/ForkTweaksGroup.kt b/app/src/main/java/com/music/bitchord/ui/screens/ForkTweaksGroup.kt
+index ff0bc51..61eb1d8 100644
+--- a/app/src/main/java/com/music/bitchord/ui/screens/ForkTweaksGroup.kt
++++ b/app/src/main/java/com/music/bitchord/ui/screens/ForkTweaksGroup.kt
+@@ -3,6 +3,7 @@ package com.music.bitchord.ui.screens
+ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.automirrored.rounded.QueueMusic
+ import androidx.compose.material.icons.rounded.AllInclusive
++import androidx.compose.material.icons.rounded.Bluetooth
+ import androidx.compose.material.icons.rounded.CloudDownload
+ import androidx.compose.material.icons.rounded.HourglassTop
+ import androidx.compose.material.icons.rounded.Pause
+@@ -68,6 +69,13 @@ internal fun ForkTweaksGroup() {
+             ForkSettings.keepMixTempo,
+         )
+         RowDivider()
++        ToggleRow(
++            Icons.Rounded.Bluetooth,
++            "Resume on reconnect",
++            "When a Bluetooth speaker or headphones drop out and come back within 10 min, keep playing",
++            ForkSettings.resumeOnReconnect,
++        )
++        RowDivider()
+         val headStart by ForkSettings.headStartMs.collectAsStateWithLifecycle()
+         SliderRow(
+             icon = Icons.Rounded.HourglassTop,
+diff --git a/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/PlayerControls.kt b/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/PlayerControls.kt
+index c6bfffd..5760290 100644
+--- a/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/PlayerControls.kt
++++ b/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/PlayerControls.kt
+@@ -1825,7 +1825,9 @@ private fun NerdStats.Snapshot.describe(): String? {
+             )
+         }
+     }
+-    return parts.joinToString(" · ").takeIf { it.isNotEmpty() }
++    if (parts.isEmpty()) return null
++    // Fork: which source is serving it, first — "Qobuz · FLAC · 24-bit …".
++    return (listOfNotNull(sourceName?.takeIf { it.isNotBlank() && it != "Unknown" }) + parts).joinToString(" · ")
+ }
+ 
+ /** The codec under its usual name rather than its MIME type. */

@@ -1,0 +1,264 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 11:17:52 +0300
+Subject: [PATCH 17/22] fork: longer AutoPlay queue (setting, default 25) and
+ load more when the queue is scrolled to its end
+
+---
+ .../java/com/music/bitchord/MainActivity.kt   |  7 ++++
+ .../bitchord/data/settings/ForkSettings.kt    | 11 ++++++
+ .../com/music/bitchord/playback/Autoplay.kt   |  6 ++--
+ .../bitchord/playback/PlaybackService.kt      | 36 +++++++++++++++++++
+ .../bitchord/playback/PlayerConnection.kt     |  8 +++++
+ .../bitchord/ui/screens/ForkTweaksGroup.kt    | 14 ++++++++
+ .../music/bitchord/ui/player/PlayerQueue.kt   | 10 ++++++
+ .../music/bitchord/ui/player/QueueEndHook.kt  |  9 +++++
+ 8 files changed, 99 insertions(+), 2 deletions(-)
+ create mode 100644 sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/QueueEndHook.kt
+
+diff --git a/app/src/main/java/com/music/bitchord/MainActivity.kt b/app/src/main/java/com/music/bitchord/MainActivity.kt
+index efd2027..d5fa645 100644
+--- a/app/src/main/java/com/music/bitchord/MainActivity.kt
++++ b/app/src/main/java/com/music/bitchord/MainActivity.kt
+@@ -206,6 +206,8 @@ import com.music.bitchord.playback.toMediaItem
+ import com.music.bitchord.playback.toSong
+ import com.music.bitchord.playback.toDirectYouTubeMediaItem
+ import com.music.bitchord.playback.toggleAutoplay
++import com.music.bitchord.playback.loadMoreAutoplay
++import com.music.bitchord.ui.player.QueueEndHook
+ import com.music.bitchord.playback.toggleShuffle
+ import com.music.bitchord.playback.upgradeQuality
+ import com.music.bitchord.playback.revertToOriginal
+@@ -918,6 +920,11 @@ private fun BitChordApp(
+         }
+     }
+     val controller = rememberMediaController()
++    // Fork: the queue reaching its end asks the service for more AutoPlay.
++    DisposableEffect(controller) {
++        QueueEndHook.onNearEnd = { controller?.loadMoreAutoplay() }
++        onDispose { QueueEndHook.onNearEnd = {} }
++    }
+     val player = rememberPlayerState(controller)
+     // A resume in a party is performed on the instant the server schedules, not
+     // when it was pressed, and nothing about the player moves in between — so
+diff --git a/app/src/main/java/com/music/bitchord/data/settings/ForkSettings.kt b/app/src/main/java/com/music/bitchord/data/settings/ForkSettings.kt
+index 513251a..fa7ff11 100644
+--- a/app/src/main/java/com/music/bitchord/data/settings/ForkSettings.kt
++++ b/app/src/main/java/com/music/bitchord/data/settings/ForkSettings.kt
+@@ -55,14 +55,25 @@ object ForkSettings {
+         prefs.edit().putLong(KEY_HEAD_START_MS, ms).apply()
+     }
+ 
++    /** AutoPlay tracks kept queued ahead, and the size of each "load more" batch. Upstream: 10. */
++    val autoplayLength = MutableStateFlow(DEFAULT_AUTOPLAY_LENGTH)
++
++    fun setAutoplayLength(n: Int) {
++        autoplayLength.value = n
++        prefs.edit().putInt(KEY_AUTOPLAY_LENGTH, n).apply()
++    }
++
+     fun init(context: Context) {
+         prefs = context.getSharedPreferences("bitchord_fork", Context.MODE_PRIVATE)
+         listOf(addonLookahead, pinTwoAhead, fastReadAhead, prefetchWhilePaused, noUpgradeAfterBlend, keepMixTempo)
+             .forEach { it.load() }
+         headStartMs.value = prefs.getLong(KEY_HEAD_START_MS, DEFAULT_HEAD_START_MS)
++        autoplayLength.value = prefs.getInt(KEY_AUTOPLAY_LENGTH, DEFAULT_AUTOPLAY_LENGTH)
+     }
+ 
+     // ponytail: measured against one bridge (search 2.6s + stream 1.2s); tune on the slider.
+     private const val DEFAULT_HEAD_START_MS = 4_000L
+     private const val KEY_HEAD_START_MS = "head_start_ms"
++    private const val DEFAULT_AUTOPLAY_LENGTH = 25
++    private const val KEY_AUTOPLAY_LENGTH = "autoplay_length"
+ }
+diff --git a/app/src/main/java/com/music/bitchord/playback/Autoplay.kt b/app/src/main/java/com/music/bitchord/playback/Autoplay.kt
+index 614e114..48f95f8 100644
+--- a/app/src/main/java/com/music/bitchord/playback/Autoplay.kt
++++ b/app/src/main/java/com/music/bitchord/playback/Autoplay.kt
+@@ -6,13 +6,15 @@ import com.music.bitchord.data.model.SearchFilter
+ import com.music.bitchord.data.model.SearchResult
+ import com.music.bitchord.data.model.QueueTier
+ import com.music.bitchord.data.model.Song
++import com.music.bitchord.data.settings.ForkSettings
+ import com.music.bitchord.data.sources.SourceRegistry
+ import com.music.bitchord.data.sources.TrackMatcher
+ import com.music.bitchord.playback.QueueCoordinator.asQueueEntry
+ import kotlinx.coroutines.CancellationException
+ 
+-/** Most AutoPlay-suggested tracks kept queued ahead of the current one at once. */
+-const val MAX_QUEUED_AUTOPLAY = 10
++/** Most AutoPlay-suggested tracks kept queued ahead of the current one at once. Fork: a setting; upstream's is 10. */
++// A party keeps upstream's 10: its server refuses a queue past its own upcoming limit.
++val MAX_QUEUED_AUTOPLAY: Int get() = if (ListenTogether.state.value.inParty) 10 else ForkSettings.autoplayLength.value
+ 
+ /**
+  * Whether AutoPlay is on for the music this device is playing.
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index 8a5485b..55bc427 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -211,6 +211,8 @@ const val ACTION_TOGGLE_FAVORITE = "com.music.bitchord.action.TOGGLE_FAVORITE"
+ 
+ /** Session command used by the media notification's and the 4×1 widget's Shuffle button. */
+ const val ACTION_TOGGLE_SHUFFLE = "com.music.bitchord.action.TOGGLE_SHUFFLE"
++/** Fork: the queue was scrolled to its end; see [PlaybackService.loadMoreAutoplay]. */
++const val ACTION_LOAD_MORE_AUTOPLAY = "com.music.bitchord.action.LOAD_MORE_AUTOPLAY"
+ 
+ /** Session actions exposed to Android Auto for the track that is playing. */
+ const val ACTION_START_STATION = "com.music.bitchord.action.START_STATION"
+@@ -2927,6 +2929,38 @@ class PlaybackService : MediaLibraryService() {
+      * replaced by a new one appended after the ones still waiting instead of
+      * everything arriving in one burst at the end of the queue.
+      */
++    private var moreAutoplayJob: Job? = null
++
++    /**
++     * Fork: the queue list reached its end — append another AutoPlay batch seeded
++     * from the last queued track, so the radio keeps going the way YouTube
++     * Music's does. Past [MAX_QUEUED_AUTOPLAY] on purpose; the top-up below only
++     * ever adds, so nothing trims it back. Not in a party, whose queue is the server's.
++     */
++    private fun loadMoreAutoplay() {
++        val exoPlayer = player ?: return
++        val party = ListenTogether.state.value
++        if (party.inParty || !autoplayEnabled(party) || exoPlayer.repeatMode == Player.REPEAT_MODE_ALL) return
++        if (boundedContextWindow != null && !boundedAutoplayEligible(exoPlayer)) return
++        if (moreAutoplayJob?.isActive == true || autoplayLoadJob?.isActive == true) return
++        if (exoPlayer.mediaItemCount == 0) return
++        val seed = exoPlayer.getMediaItemAt(exoPlayer.mediaItemCount - 1).toSong()
++        moreAutoplayJob = scope.launch {
++            val queued = (0 until exoPlayer.mediaItemCount).map { exoPlayer.getMediaItemAt(it).toSong() }
++            val existing = if (AppSettings.dontRepeatSuggestions.value) queued + sessionSongHistory else queued
++            val more = loadAutoplayTracks(existing, seed, MAX_QUEUED_AUTOPLAY).getOrElse {
++                TrackLog.w("BitChord", "more AutoPlay failed: ${it.message}", about = seed.videoId)
++                return@launch
++            }
++            val latest = player ?: return@launch
++            val now = (0 until latest.mediaItemCount).map { latest.getMediaItemAt(it).toSong() }
++            val fresh = more.filterNot { song -> now.any { QueueBuilder.isSameRecording(it, song) } }
++            if (fresh.isNotEmpty()) latest.addMediaItems(fresh.map { it.toMediaItem() })
++            if (AppSettings.dontRepeatSuggestions.value) sessionSongHistory += fresh
++            TrackLog.d("BitChord", "AutoPlay extended by ${fresh.size} from '${seed.title}'", about = seed.videoId)
++        }
++    }
++
+     private fun loadAutoplayForCurrentTrack() {
+         val exoPlayer = player ?: return
+         val party = ListenTogether.state.value
+@@ -8192,6 +8226,7 @@ class PlaybackService : MediaLibraryService() {
+                 .add(boundedContextCommand)
+                 .add(clearBoundedContextCommand)
+                 .add(autoplayCommand)
++                .add(SessionCommand(ACTION_LOAD_MORE_AUTOPLAY, Bundle.EMPTY))
+                 .add(shuffleCommand)
+                 .add(startStationCommand)
+                 .add(revertToOriginalCommand)
+@@ -8229,6 +8264,7 @@ class PlaybackService : MediaLibraryService() {
+                 ACTION_START_BOUNDED_CONTEXT -> startBoundedContext(args)
+                 ACTION_CLEAR_BOUNDED_CONTEXT -> clearBoundedContext()
+                 ACTION_TOGGLE_AUTOPLAY -> toggleAutoplayFromNotification()
++                ACTION_LOAD_MORE_AUTOPLAY -> loadMoreAutoplay()
+                 ACTION_TOGGLE_SHUFFLE -> toggleShuffleFromSession()
+                 ACTION_START_STATION -> startStationFromSession()
+                 ACTION_REVERT_TO_ORIGINAL -> revertCurrentToOriginal()
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlayerConnection.kt b/app/src/main/java/com/music/bitchord/playback/PlayerConnection.kt
+index d082e9b..939caa4 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlayerConnection.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlayerConnection.kt
+@@ -103,6 +103,14 @@ fun MediaController.toggleAutoplay() {
+     )
+ }
+ 
++/** Fork: asks the playback service for another AutoPlay batch; see [ACTION_LOAD_MORE_AUTOPLAY]. */
++fun MediaController.loadMoreAutoplay() {
++    sendCustomCommand(
++        SessionCommand(ACTION_LOAD_MORE_AUTOPLAY, Bundle.EMPTY),
++        Bundle.EMPTY,
++    )
++}
++
+ /**
+  * Routes Shuffle through the playback service so changing its state and
+  * reordering the service-owned queue happen as one operation.
+diff --git a/app/src/main/java/com/music/bitchord/ui/screens/ForkTweaksGroup.kt b/app/src/main/java/com/music/bitchord/ui/screens/ForkTweaksGroup.kt
+index 3a36e88..ff0bc51 100644
+--- a/app/src/main/java/com/music/bitchord/ui/screens/ForkTweaksGroup.kt
++++ b/app/src/main/java/com/music/bitchord/ui/screens/ForkTweaksGroup.kt
+@@ -2,6 +2,7 @@ package com.music.bitchord.ui.screens
+ 
+ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.automirrored.rounded.QueueMusic
++import androidx.compose.material.icons.rounded.AllInclusive
+ import androidx.compose.material.icons.rounded.CloudDownload
+ import androidx.compose.material.icons.rounded.HourglassTop
+ import androidx.compose.material.icons.rounded.Pause
+@@ -16,6 +17,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
+ import androidx.lifecycle.compose.collectAsStateWithLifecycle
+ import com.music.bitchord.data.settings.ForkSettings
+ import java.util.Locale
++import kotlin.math.roundToInt
+ 
+ /** The personal fork's switches — see [ForkSettings]. English only, on purpose: no strings.xml to conflict on. */
+ @Composable
+@@ -77,6 +79,18 @@ internal fun ForkTweaksGroup() {
+             valueRange = 0f..8f,
+             steps = 15,
+         )
++        RowDivider()
++        val autoplayLength by ForkSettings.autoplayLength.collectAsStateWithLifecycle()
++        SliderRow(
++            icon = Icons.Rounded.AllInclusive,
++            title = "AutoPlay queue length",
++            subtitle = "Songs AutoPlay keeps queued; scrolling to the end of the queue loads this many more",
++            value = "$autoplayLength",
++            sliderValue = autoplayLength.toFloat(),
++            onSliderValue = { ForkSettings.setAutoplayLength((it / 5).roundToInt() * 5) },
++            valueRange = 10f..50f,
++            steps = 7,
++        )
+     }
+ }
+ 
+diff --git a/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/PlayerQueue.kt b/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/PlayerQueue.kt
+index db046e0..0996494 100644
+--- a/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/PlayerQueue.kt
++++ b/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/PlayerQueue.kt
+@@ -49,6 +49,8 @@ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.setValue
+ import androidx.lifecycle.compose.collectAsStateWithLifecycle
+ import androidx.compose.runtime.snapshotFlow
++import kotlinx.coroutines.flow.distinctUntilChanged
++import kotlinx.coroutines.flow.filter
+ import kotlinx.coroutines.flow.first
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+@@ -240,6 +242,14 @@ internal fun InlineQueue(
+         snapshotFlow { listState.isScrollInProgress }.collect(onScrollingChange)
+     }
+     val keepScroll = remember(listState) { keepScrollInList(listState) }
++    // Fork: reaching the last rows asks for more AutoPlay, once per arrival.
++    LaunchedEffect(listState, autoplayEnabled, controlsLocked) {
++        if (!autoplayEnabled || controlsLocked) return@LaunchedEffect
++        snapshotFlow {
++            val info = listState.layoutInfo
++            info.totalItemsCount > 0 && (info.visibleItemsInfo.lastOrNull()?.index ?: -1) >= info.totalItemsCount - 3
++        }.distinctUntilChanged().filter { it }.collect { QueueEndHook.onNearEnd() }
++    }
+     val controlsOnScroll = rememberPlayerControlsOnScroll(
+         enabled = collapsePlayerOnScroll,
+         onReveal = onRevealPlayer,
+diff --git a/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/QueueEndHook.kt b/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/QueueEndHook.kt
+new file mode 100644
+index 0000000..aa28e7b
+--- /dev/null
++++ b/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/QueueEndHook.kt
+@@ -0,0 +1,9 @@
++package com.music.bitchord.ui.player
++
++/**
++ * Fork: called when the queue list is scrolled to its last rows, so the app can
++ * ask for more AutoPlay the way YouTube Music does. A no-op until a platform sets it.
++ */
++object QueueEndHook {
++    var onNearEnd: () -> Unit = {}
++}

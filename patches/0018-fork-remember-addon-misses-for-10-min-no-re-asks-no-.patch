@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 11:26:53 +0300
+Subject: [PATCH 18/22] fork: remember addon misses for 10 min (no re-asks, no
+ head-start wait); sleep timer stops read-ahead; resume re-runs a finished
+ read-ahead
+
+---
+ .../com/music/bitchord/playback/AudioCache.kt | 24 ++++++++++++++++++-
+ .../bitchord/playback/PlaybackService.kt      | 13 +++++++---
+ 2 files changed, 33 insertions(+), 4 deletions(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+index 063c28f..c5b2c5a 100644
+--- a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
++++ b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+@@ -42,6 +42,7 @@ import kotlinx.coroutines.ensureActive
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.StateFlow
+ import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.isActive
+ import kotlinx.coroutines.job
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.withContext
+@@ -1186,6 +1187,21 @@ object AudioCache {
+     private var job: Job? = null
+     private var pendingQueue: List<String> = emptyList()
+ 
++    /** Fork: whether a read-ahead is still running — see PlaybackService's resume. */
++    val warming: Boolean get() = job?.isActive == true
++
++    /** Fork: when the quick sources last had nothing for a track; asked again after [PIN_MISS_TTL_MS]. */
++    private val pinMisses = ConcurrentHashMap<String, Long>()
++    private const val PIN_MISS_TTL_MS = 10 * 60 * 1000L
++
++    /** Fork: whether the quick sources were asked about [id] recently and had nothing. */
++    fun recentlyMissed(id: String): Boolean {
++        val at = pinMisses[id] ?: return false
++        if (SystemClock.elapsedRealtime() - at < PIN_MISS_TTL_MS) return true
++        pinMisses.remove(id)
++        return false
++    }
++
+     /**
+      * Gets the queue ahead of the one playing warmed up, in play order.
+      *
+@@ -1333,6 +1349,8 @@ object AudioCache {
+     private suspend fun pinSubstitute(id: String, target: TrackMatcher.Target): Boolean {
+         // A substitute that just failed in the player stays refused; re-pinning it reads ~50MB for nothing.
+         if (StreamChoice.substitutesRefused(id)) return false
++        // Nor is a track the quick sources just didn't have asked about again on every queue change.
++        if (recentlyMissed(id)) return false
+         StreamChoice.of(id)?.let { pinned ->
+             if (!StreamChoice.isSubstitute(id)) return false
+             // Re-stamped, so a pin made a track early doesn't age out before
+@@ -1351,7 +1369,11 @@ object AudioCache {
+         }
+         val stream = runCatching { SourceResolver.prefetchSubstitute(target) }
+             .onFailure { TrackLog.d(TAG, "warm-up substitute failed for $id: ${it.message}", about = id) }
+-            .getOrNull() ?: return false
++            .getOrNull() ?: run {
++                // Only a lookup that ran to the end is a miss; a cancelled one (the queue moved) is not.
++                if (coroutineContext.isActive) pinMisses[id] = SystemClock.elapsedRealtime()
++                return false
++            }
+         // The pinned branch of the resolver has no manifest check (the race
+         // has); a pinned DASH/HLS URL fails the standby and drops the blend.
+         if (StreamContainer.isManifest(stream.url)) return false
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index 55bc427..572e05d 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -889,6 +889,8 @@ class PlaybackService : MediaLibraryService() {
+             // the last thing that happens before the process goes idle.
+             // Fork: a user pause keeps read-ahead going; a stall still frees the bandwidth.
+             if (isPlaying) {
++                // Fork: a read-ahead that ended while paused (done, failed, or its pins aged out) runs again.
++                if (!AudioCache.warming) cancelPrefetch()
+                 prefetchAround(exoPlayer)
+             } else if (exoPlayer.playWhenReady || !ForkSettings.prefetchWhilePaused.value) {
+                 cancelPrefetch()
+@@ -3607,13 +3609,15 @@ class PlaybackService : MediaLibraryService() {
+         // "Sleep after this song": the queue moving on by itself is the
+         // moment the track the user meant has finished. REPEAT counts
+         // too, or the timer would never fire with repeat-one on.
+-        if (ended && SleepTimer.afterTrack.value) {
++        val sleptAfterTrack = ended && SleepTimer.afterTrack.value
++        if (sleptAfterTrack) {
+             exoPlayer.pause()
+             SleepTimer.cancel()
+         }
+         if (exoPlayer.isPlaying) registerCurrentPlay()
+         savePlaybackState(exoPlayer)
+-        prefetchAround(exoPlayer)
++        // Fork: nothing is read ahead for a listener the sleep timer just stopped.
++        if (sleptAfterTrack) cancelPrefetch() else prefetchAround(exoPlayer)
+         // The second look belongs to the track it was started for; the
+         // queue moving on ends it — unless it is already proving what it
+         // found, see [cancelStaleUpgradeJob] — and starts the new
+@@ -5564,7 +5568,8 @@ class PlaybackService : MediaLibraryService() {
+         // Fork: the modules get a head start after all — see
+         // [ForkSettings.headStartMs]. Unlike the one described above, YouTube is
+         // already resolving underneath, so a miss costs the wait and not a cold walk.
+-        val headStart = ForkSettings.headStartMs.value
++        // No wait for a track the addons were just asked about and didn't have.
++        val headStart = if (AudioCache.recentlyMissed(videoId)) 0L else ForkSettings.headStartMs.value
+         val early = if (headStart > 0) withTimeoutOrNull(headStart) { lookup.await() } else null
+         val quick: SourceStream? = early ?: select {
+             lookup.onAwait { it }
+@@ -6461,6 +6466,8 @@ class PlaybackService : MediaLibraryService() {
+                 if (remaining > 0) delay(remaining)
+                 player?.pause()
+                 SleepTimer.cancel()
++                // Fork: a sleep-timer pause stops read-ahead; a user pause keeps it (see onIsPlayingChanged).
++                cancelPrefetch()
+             }
+         }
+     }

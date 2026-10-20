@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: akunieminen <aku.nieminen1@gmail.com>
 Date: Tue, 20 Oct 2026 11:03:43 +0300
-Subject: [PATCH 16/16] fork: keep the matched tempo after a beat-matched mix
+Subject: [PATCH 16/22] fork: keep the matched tempo after a beat-matched mix
  instead of snapping back
 
 ---
