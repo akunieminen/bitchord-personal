@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 13:51:49 +0300
+Subject: [PATCH 25/29] fork: a track whose #alt holds a kept YouTube copy gets
+ a fresh #src entry, so replays start from the addon instead of upgrading
+ mid-song
+
+---
+ .../com/music/bitchord/playback/AudioCache.kt | 21 ++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+index 818ca3f..6a5b5c6 100644
+--- a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
++++ b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+@@ -471,7 +471,7 @@ object AudioCache {
+                 when {
+                     rendition != null -> "$videoId#$rendition"
+                     SourceResolver.canSubstituteForYouTube() ->
+-                        "$videoId#alt${atmosKeySuffix()}".let { completeSibling(videoId, it) ?: it }
++                        substituteKey(videoId).let { completeSibling(videoId, it) ?: it }
+                     else -> completeSibling(videoId, videoId) ?: videoId
+                 }
+             }
+@@ -524,6 +524,25 @@ object AudioCache {
+      * second, byte-identical 3.8 MB itag 251 file under the plain key, while
+      * offline plays came straight off disk.
+      */
++    /**
++     * Fork: where a track a higher-ranked source may serve is filed — normally `#alt`.
++     * A YouTube (or JioSaavn) copy kept there from an earlier play is read off disk ahead
++     * of any pin, so every replay started on YouTube and upgraded mid-song; such a track
++     * gets a fresh `#src` entry instead. Chosen once per track per process, so a track
++     * never changes entries between the opens of one playback (two files, one decoder).
++     * Offline still finds the old copy through [completeSibling].
++     */
++    private val substituteKeys = ConcurrentHashMap<String, String>()
++
++    private fun substituteKey(videoId: String): String {
++        val alt = "$videoId$ALT_SUFFIX${atmosKeySuffix()}"
++        return substituteKeys.getOrPut(alt) {
++            val stale = ::cache.isInitialized &&
++                runCatching { cache.getCachedSpans(alt).isNotEmpty() && isKeptOrigin(alt) }.getOrDefault(false)
++            if (stale) "$videoId#src${atmosKeySuffix()}" else alt
++        }
++    }
++
+     private fun completeSibling(videoId: String, preferred: String): String? {
+         if (!::cache.isInitialized) return null
+         // Ahead of the connectivity check, which is a binder call: nearly every

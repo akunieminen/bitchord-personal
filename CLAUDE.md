@@ -55,7 +55,7 @@ cd ../bitchord-personal && scripts/export-patches.sh && git add -A && git commit
 - A clean transition: next track `warmed: … from <addon>`, no `upgraded to`, no `swap seam`, and at a crossfade
   handoff no MusicFx close/open.
 
-## Patch map (22 patches on v1.8.1)
+## Patch map (patches on v1.8.1; `ls patches` for the current list)
 
 | Concern | Where |
 |---|---|
@@ -70,6 +70,9 @@ cd ../bitchord-personal && scripts/export-patches.sh && git add -A && git commit
 | Audio sessions: two fixed sessions, both advertised to effect apps | `PlaybackService.kt` |
 | QOL: BT reconnect resume, unplayable toast, sleep fade + 5/10 min, source on stats line | `PlaybackService.kt`, `SleepTimer.kt`, `PlayerControls.kt` |
 | Updater → this repo; `.forkRevision` versionName; TrackLog to logcat | `AppUpdateChecker.kt`, `app/build.gradle.kts`, `AndroidStreamHooks.kt` |
+| Upgrade swap: offset measured on the audio (`VersionAudioAligner.findRenditionOffsetMs`, decodes both cached heads), then the muted standby is **speed-nudged** to within 20 ms (never re-seeked) and a 150 ms blend; no fade at all if it can't align; 5 misses end the re-offers | `PlaybackService.kt` (`seamlessSwapToStream`, `measureUpgradeOffset`), `VersionAudioAligner.kt` |
+| `#src` key: a track whose `#alt` holds a kept YouTube copy *and that an addon has served* (`bc_addon_has` flag) is filed under `#src`, so replays (Listen again) start from the addon; memoized per process, never chosen offline | `AudioCache.kt` (`substituteKey`, `recordServed`, `completeSibling`) |
+| Addon trouble ≠ miss: `AddonClient.lastTroubleAtMs` (429/5xx/timeouts); misses only remembered when no trouble during the lookup; spoiled next-track lookups retried 3 × 20 s | `AddonClient.kt`, `AudioCache.kt` |
 
 ## Gotchas learned the hard way
 
@@ -88,6 +91,15 @@ cd ../bitchord-personal && scripts/export-patches.sh && git add -A && git commit
   (Qobuz addon first, then the lossless bridge). A dead addon costs up to the 20 s substitute timeout on every lookup.
 - **Advanced Automix speed changes are audible** on this phone + Bluetooth (AudioTrack params on float output, Sonic
   on 16-bit). Automix is off on the owner's phone; plain Crossfade is fine.
+- **Never align two copies by seeking.** Every seek restarts output with 150–250 ms of unpredictable latency, and
+  `currentPosition` right after a seek is not trustworthy; overlapping copies a few hundred ms apart sound like a
+  doubling or a repeated bar. Settle ~0.6 s, average several reads, nudge speed on the muted player.
+- Upstream keeps YouTube/JioSaavn copies ("kept origins") but drops addon FLACs after playback, so before the `#src`
+  key every replayed song started on YouTube.
+- The shared Qobuz addon rate-limits (429 → `This addon is rate limiting BitChord`); a self-hosted addon on the
+  owner's own subscription is the real fix (protocol: `data/sources/addon/AddonModels.kt`).
+- Builds get OOM-killed while workflows run: `./gradlew --stop`, `--max-workers=4`, and always check the APK's
+  versionName before `adb install`.
 - Bluetooth output is never lossless (`lossless output: capable=false`); FLAC still saves one lossy generation.
 
 ## Backlog (offered, not done)

@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 14:41:42 +0300
+Subject: [PATCH 29/29] fork: upgrade crossfade aligns by nudging the muted
+ standby's speed to within 20ms (no seek latency), then a 150ms blend; no fade
+ at all if it can't
+
+---
+ .../bitchord/playback/PlaybackService.kt      | 87 +++++++++++--------
+ 1 file changed, 51 insertions(+), 36 deletions(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index 308a325..12eace7 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -4853,50 +4853,60 @@ class PlaybackService : MediaLibraryService() {
+                     QualityUpgrade.shelve(mediaId, stream)
+                     return false
+                 }
+-                // The resync seek resumes R ms late while the active player keeps going, so the
+-                // standby would enter the fade R ms behind (a flam/echo). Measure R once its audio
+-                // is moving, seek ahead by it once, and fade only when that audio is moving too.
+-                // ponytail: assumes R repeats seek to seek; expect ±10-20ms left. The log is the knob.
+-                suspend fun awaitMoving() {
+-                    val from = standbyPlayer.currentPosition
+-                    val by = SystemClock.elapsedRealtime() + 300L
+-                    while (coroutineContext.isActive && standbyPlayer.currentPosition == from &&
+-                        SystemClock.elapsedRealtime() < by
+-                    ) {
+-                        delay(5)
++                // Fork: line the copies up to within ALIGN_TOLERANCE_MS before fading, the way DJ
++                // software beatmatches: never by seeking — every seek restarts output with 150-250ms
++                // of unpredictable latency, heard as a doubling or a repeated bar — but by running
++                // the muted standby a few percent fast or slow until it has caught up, then back to
++                // speed. Positions are only trusted once the standby has played a while since its
++                // last seek, and as an average of several reads.
++                val baseSpeed = activePlayer.playbackParameters.speed
++                fun offBy() = activePlayer.currentPosition + offset - standbyPlayer.currentPosition // + = standby behind
++                suspend fun settledOffBy(): Long {
++                    var sum = 0L
++                    repeat(5) {
++                        sum += offBy()
++                        delay(20)
+                     }
++                    return sum / 5
+                 }
+-                awaitMoving()
+-                val lag = activePlayer.currentPosition + offset - standbyPlayer.currentPosition
+-                TrackLog.d("BitChord", "upgrade crossfade: standby ${lag}ms behind before compensation", about = mediaId)
+-                // Fork: the lag above is the standby's start-up, not the cost of a seek — a
+-                // second seek into buffered audio lands at once, so adding the lag overshot by
+-                // about as much (seen: 200ms behind became 250ms ahead, every 5s, forever).
+-                // Re-seek to where the active player is now, and fade once within 300ms — or
+-                // anyway on the third miss for this track: a short flam beats never upgrading.
+-                if (abs(lag) in 15L..3_000L) {
++                delay(ALIGN_SETTLE_MS)
++                var off = settledOffBy()
++                TrackLog.d("BitChord", "upgrade crossfade: standby ${off}ms behind once settled", about = mediaId)
++                if (abs(off) > 1_500L) {
++                    // Too far to nudge in reasonable time: one coarse seek, then settle again.
+                     standbyPlayer.seekTo(currentIndex, activePlayer.currentPosition + offset)
+-                    awaitMoving()
++                    delay(ALIGN_SETTLE_MS)
++                    off = settledOffBy()
+                 }
+-                val residual = activePlayer.currentPosition + offset - standbyPlayer.currentPosition
+-                if (abs(residual) > 300L) {
++                val alignBy = SystemClock.elapsedRealtime() + ALIGN_BUDGET_MS
++                while (coroutineContext.isActive && abs(off) > ALIGN_TOLERANCE_MS &&
++                    SystemClock.elapsedRealtime() < alignBy && stillWanted()
++                ) {
++                    // Catch up over ~1.5s, never more than 8% off speed.
++                    // ponytail: proportional only; add damping if the log shows it hunting
++                    val nudge = (off / 1_500f).coerceIn(-0.08f, 0.08f)
++                    standbyPlayer.setPlaybackSpeed(baseSpeed * (1f + nudge))
++                    delay(250)
++                    off = settledOffBy()
++                }
++                standbyPlayer.setPlaybackSpeed(baseSpeed)
++                delay(150)
++                off = settledOffBy()
++                TrackLog.d("BitChord", "upgrade crossfade: aligned to ${off}ms", about = mediaId)
++                if (abs(off) > ALIGN_TOLERANCE_MS * 2) {
++                    // Not close enough to blend two copies of one recording without a doubling:
++                    // no fade at all this time. The re-offer tries again; five misses end it.
+                     // ponytail: never pruned; one entry per track that missed, for the process's life
+                     val misses = (alignmentMisses[mediaId] ?: 0) + 1
+                     alignmentMisses[mediaId] = misses
+-                    // Past 1s it is a seek in the window or a stalled/unseekable standby, not
+-                    // alignment: fading into it would undo the seek or restart the song.
+-                    if (misses < 3 || abs(residual) > 1_000L || !standbyPlayer.isPlaying) {
+-                        TrackLog.d("BitChord", "upgrade crossfade: standby still ${residual}ms off (miss $misses); waiting for the re-offer", about = mediaId)
+-                        // ponytail: 5 misses ends the 5s re-offer loop for this track this session
+-                        if (misses >= 5) {
+-                            QualityUpgrade.forget(mediaId)
+-                            QualityUpgrade.refuseUpgrades(mediaId)
+-                        }
+-                        return false
++                    TrackLog.d("BitChord", "upgrade crossfade: standby still ${off}ms off (miss $misses); waiting for the re-offer", about = mediaId)
++                    if (misses >= 5) {
++                        QualityUpgrade.forget(mediaId)
++                        QualityUpgrade.refuseUpgrades(mediaId)
+                     }
+-                    TrackLog.d("BitChord", "upgrade crossfade: standby still ${residual}ms off after $misses tries; fading anyway", about = mediaId)
++                    return false
+                 }
+-                driftBaseline = residual
++                driftBaseline = off
+             } else {
+                 val seekTimeout = SystemClock.elapsedRealtime() + 400L
+                 while (coroutineContext.isActive && standbyPlayer.playbackState != Player.STATE_READY && SystemClock.elapsedRealtime() < seekTimeout) {
+@@ -4912,7 +4922,8 @@ class PlaybackService : MediaLibraryService() {
+             swappingMediaId = mediaId
+ 
+             if (willPlay) {
+-                val swapCrossfadeMs = 300L
++                // Fork: 150ms — two aligned copies of one recording need only a short blend.
++                val swapCrossfadeMs = 150L
+                 val fadeStart = SystemClock.elapsedRealtime()
+                 try {
+                     while (coroutineContext.isActive) {
+@@ -9431,6 +9442,10 @@ class PlaybackService : MediaLibraryService() {
+         /** Fork: head of the upgrade's file fetched for alignment, and how long measuring may take. */
+         const val UPGRADE_ALIGN_HEAD_BYTES = 3L * 1024 * 1024
+         const val UPGRADE_ALIGN_TIMEOUT_MS = 4_000L
++        /** Fork: how close the two copies must be before the upgrade fades, and how long to try. */
++        const val ALIGN_TOLERANCE_MS = 20L
++        const val ALIGN_SETTLE_MS = 600L
++        const val ALIGN_BUDGET_MS = 6_000L
+ 
+         /** Loaded media bytes an audition needs before its buffered position is believed. */
+         const val MIN_PROVEN_LOAD_BYTES = UPGRADE_HEADER_BYTES

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: akunieminen <aku.nieminen1@gmail.com>
 Date: Tue, 20 Oct 2026 10:22:46 +0300
-Subject: [PATCH 10/22] fork: PR 932 audio polish
+Subject: [PATCH 10/29] fork: PR 932 audio polish
 
 ---
  .../bitchord/playback/PlaybackService.kt      | 31 ++++++++++++++-----

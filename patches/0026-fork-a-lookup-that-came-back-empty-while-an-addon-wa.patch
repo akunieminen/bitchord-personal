@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 13:58:59 +0300
+Subject: [PATCH 26/29] fork: a lookup that came back empty while an addon was
+ rate limiting or failing is not remembered as a miss
+
+---
+ .../data/sources/addon/AddonClient.kt         | 20 ++++++++++++++++++-
+ .../com/music/bitchord/playback/AudioCache.kt | 10 ++++++++--
+ 2 files changed, 27 insertions(+), 3 deletions(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/data/sources/addon/AddonClient.kt b/app/src/main/java/com/music/bitchord/data/sources/addon/AddonClient.kt
+index c012182..1b45a0c 100644
+--- a/app/src/main/java/com/music/bitchord/data/sources/addon/AddonClient.kt
++++ b/app/src/main/java/com/music/bitchord/data/sources/addon/AddonClient.kt
+@@ -339,7 +339,17 @@ class AddonClient(rawBaseUrl: String) {
+                 .header("User-Agent", USER_AGENT)
+                 .build()
+ 
+-            val wait = client.newCall(request).execute().use { response ->
++            // Fork: anything but "not found" marks the addons as in trouble — see lastTroubleAtMs.
++            val response0 = try {
++                client.newCall(request).execute()
++            } catch (e: java.io.IOException) {
++                lastTroubleAtMs = android.os.SystemClock.elapsedRealtime()
++                throw e
++            }
++            val wait = response0.use { response ->
++                if (!response.isSuccessful && response.code != 404) {
++                    lastTroubleAtMs = android.os.SystemClock.elapsedRealtime()
++                }
+                 when {
+                     response.isSuccessful ->
+                         return@withContext response.body?.string()?.takeIf { it.isNotBlank() }
+@@ -406,6 +416,14 @@ class AddonClient(rawBaseUrl: String) {
+     private fun keyOf(vararg parts: String) = parts.joinToString("|") { "${it.length}:$it" }
+ 
+     companion object {
++        /**
++         * Fork: when any addon last failed for a reason other than not having the
++         * track (a 429, a 5xx, a timeout). A lookup that came back empty while this
++         * moved is not a miss worth remembering.
++         */
++        @Volatile
++        var lastTroubleAtMs = 0L
++
+         private const val TAG = "BitChord"
+ 
+         /** The tiers [AddonSource][com.music.bitchord.data.sources.AddonSource] asks in. */
+diff --git a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+index 6a5b5c6..55f6f87 100644
+--- a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
++++ b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+@@ -1388,11 +1388,17 @@ object AudioCache {
+             TrackLog.d(TAG, "not pinning $id: a YouTube copy is already cached under #alt", about = id)
+             return false
+         }
++        val askedAt = SystemClock.elapsedRealtime()
+         val stream = runCatching { SourceResolver.prefetchSubstitute(target) }
+             .onFailure { TrackLog.d(TAG, "warm-up substitute failed for $id: ${it.message}", about = id) }
+             .getOrNull() ?: run {
+-                // Only a lookup that ran to the end is a miss; a cancelled one (the queue moved) is not.
+-                if (coroutineContext.isActive) pinMisses[id] = SystemClock.elapsedRealtime()
++                // Only a lookup that ran to the end is a miss; a cancelled one (the queue moved)
++                // is not, nor one during which an addon was rate limiting or failing.
++                if (coroutineContext.isActive &&
++                    com.music.bitchord.data.sources.addon.AddonClient.lastTroubleAtMs < askedAt
++                ) {
++                    pinMisses[id] = SystemClock.elapsedRealtime()
++                }
+                 return false
+             }
+         // The pinned branch of the resolver has no manifest check (the race

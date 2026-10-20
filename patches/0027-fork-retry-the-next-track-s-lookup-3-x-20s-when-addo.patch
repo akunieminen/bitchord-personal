@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 14:23:12 +0300
+Subject: [PATCH 27/29] fork: retry the next track's lookup (3 x 20s) when
+ addon trouble spoiled it
+
+---
+ .../com/music/bitchord/playback/AudioCache.kt | 23 ++++++++++++++++---
+ 1 file changed, 20 insertions(+), 3 deletions(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+index 55f6f87..1555cf2 100644
+--- a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
++++ b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+@@ -1212,6 +1212,7 @@ object AudioCache {
+     /** Fork: when the quick sources last had nothing for a track; asked again after [PIN_MISS_TTL_MS]. */
+     private val pinMisses = ConcurrentHashMap<String, Long>()
+     private const val PIN_MISS_TTL_MS = 10 * 60 * 1000L
++    private const val PIN_RETRY_MS = 20_000L
+ 
+     /** Fork: whether the quick sources were asked about [id] recently and had nothing. */
+     fun recentlyMissed(id: String): Boolean {
+@@ -1319,11 +1320,27 @@ object AudioCache {
+                 // outranks YouTube and read-ahead is the only writer, or a
+                 // source has been pinned and every writer now resolves to it.
+                 val cacheBytes = (!substitutable || warmed) && !pinnedToYouTube
++                fun readAheadBytes() = launch(TrackLog.about(next)) {
++                    delay(readAheadDelayMs)
++                    fetch(next, 0, PRELOAD_BYTES)
++                    fetchWhole(next)
++                }
+                 if (cacheBytes) {
++                    readAheadBytes()
++                } else if (substitutable && target != null && !pinnedToYouTube) {
++                    // Fork: a lookup an addon's rate limit or outage spoiled is tried again while
++                    // this track plays — there are usually minutes to spare — instead of leaving
++                    // the next one to start on YouTube. A genuine miss stops it (recentlyMissed).
+                     launch(TrackLog.about(next)) {
+-                        delay(readAheadDelayMs)
+-                        fetch(next, 0, PRELOAD_BYTES)
+-                        fetchWhole(next)
++                        repeat(3) {
++                            delay(PIN_RETRY_MS)
++                            if (pendingQueue.firstOrNull() != next || recentlyMissed(next)) return@launch
++                            if (pinSubstitute(next, target)) {
++                                TrackLog.d(TAG, "pinned $next on retry ${it + 1}", about = next)
++                                readAheadBytes()
++                                return@launch
++                            }
++                        }
+                     }
+                 }
+                 // ponytail: the track after next is pinned too, URL only. Media3

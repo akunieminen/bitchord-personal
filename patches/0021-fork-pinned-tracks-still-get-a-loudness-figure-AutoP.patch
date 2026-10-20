@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: akunieminen <aku.nieminen1@gmail.com>
 Date: Tue, 20 Oct 2026 12:01:27 +0300
-Subject: [PATCH 21/22] fork: pinned tracks still get a loudness figure;
+Subject: [PATCH 21/29] fork: pinned tracks still get a loudness figure;
  AutoPlay de-dup off the main thread
 
 ---

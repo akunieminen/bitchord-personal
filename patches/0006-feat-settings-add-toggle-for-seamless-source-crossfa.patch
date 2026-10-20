@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: kavinned <142488487+kavinned@users.noreply.github.com>
 Date: Tue, 20 Oct 2026 00:57:15 +0800
-Subject: [PATCH 06/22] feat(settings): add toggle for seamless source
+Subject: [PATCH 06/29] feat(settings): add toggle for seamless source
  crossfade defaulting to false
 
 (cherry picked from commit dc82057f5ca434b1390ff8200e1b710c430e081c)

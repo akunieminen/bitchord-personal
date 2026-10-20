@@ -1,0 +1,243 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 13:48:52 +0300
+Subject: [PATCH 24/29] fork: quality-upgrade swap aligned on the audio (no
+ jump back); first-missing-byte fetch only in read-ahead (it emptied the
+ upgrade's head)
+
+---
+ .../com/music/bitchord/playback/AudioCache.kt | 23 ++++----
+ .../bitchord/playback/PlaybackService.kt      | 54 +++++++++++++++----
+ .../playback/smart/VersionAudioAligner.kt     | 38 +++++++++++++
+ 3 files changed, 96 insertions(+), 19 deletions(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+index 38d92f8..818ca3f 100644
+--- a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
++++ b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+@@ -1463,7 +1463,11 @@ object AudioCache {
+             if (pendingQueue.firstOrNull() != videoId) return false
+             val length = minOf(CHUNK_BYTES, total - position)
+             if (cache.getCachedBytes(key, position, length) < length) {
+-                fetch(videoId, position, length)
++                // Fork: from the first byte not on disk — a lock probe over a cached head
++                // "lands" without the network, and the pull behind it reads a locked hole
++                // into nowhere. Here only: an upgrade's head fetched from byte 1792 came back empty.
++                val head = cache.getCachedLength(key, position, length).coerceAtLeast(0)
++                fetch(videoId, position + head, length - head)
+                 // Written nowhere means the entry is held elsewhere; the rest
+                 // of this pass would be just as wasted. See [fetch] for why
+                 // this can be true even though the fetch just above returned
+@@ -2043,6 +2047,10 @@ object AudioCache {
+      * [CacheDataSource] to open against; only the key decides which bytes come
+      * back.
+      */
++    /** Fork: the rendition [uri] reads from, as the player's own key factory files it. */
++    fun renditionAt(uri: Uri): Rendition? =
++        if (::cache.isInitialized) renditionFor(keyFactory.buildCacheKey(DataSpec(uri))) else null
++
+     fun renditionDataSource(uri: Uri, rendition: Rendition): MediaDataSource =
+         CacheMediaDataSource(
+             CacheDataSource.Factory()
+@@ -2224,11 +2232,6 @@ object AudioCache {
+     ) {
+         if (upstreamFactory == null) return
+         if (cache.getCachedBytes(cacheKey, position, length) >= length) return
+-        // Fork: knock at the first byte not on disk. A probe over a cached head
+-        // "lands" without the network, and the pull behind it reads a locked hole into nowhere.
+-        val head = cache.getCachedLength(cacheKey, position, length).coerceAtLeast(0)
+-        val from = position + head
+-        val rest = length - head
+ 
+         // A cheap first knock rather than the whole range on the door.
+         // Losing this entry to another writer isn't something
+@@ -2244,11 +2247,11 @@ object AudioCache {
+         // time. A small probe reaches the same verdict for a fraction of
+         // the cost, and only a probe that actually lands is worth following
+         // with the rest of the range.
+-        if (rest > LOCK_PROBE_BYTES) {
+-            pull(cacheKey, uri, from, LOCK_PROBE_BYTES, pinKey)
+-            if (cache.getCachedBytes(cacheKey, from, LOCK_PROBE_BYTES) < LOCK_PROBE_BYTES) return
++        if (length > LOCK_PROBE_BYTES) {
++            pull(cacheKey, uri, position, LOCK_PROBE_BYTES, pinKey)
++            if (cache.getCachedBytes(cacheKey, position, LOCK_PROBE_BYTES) < LOCK_PROBE_BYTES) return
+         }
+-        pull(cacheKey, uri, from, rest, pinKey)
++        pull(cacheKey, uri, position, length, pinKey)
+     }
+ 
+     /** The actual network pull behind [fetch], unconditional and unchecked. */
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index 944108f..622c869 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -4684,6 +4684,29 @@ class PlaybackService : MediaLibraryService() {
+      *
+      * Returns true if the swap was performed, false if the track moved on or was aborted.
+      */
++    /**
++     * Fork: the shift from the copy playing to the upgrade's, measured on the audio
++     * (see [VersionAudioAligner.findRenditionOffsetMs]); null when either head is too
++     * short to trust or the answer is implausible.
++     */
++    private suspend fun measureUpgradeOffset(mediaId: String, playingUri: Uri, upgradedUri: String): Long? {
++        val upgraded = Uri.parse(upgradedUri)
++        // ~15s of 24-bit FLAC; the audition only fetched the first megabyte.
++        AudioCache.warmRange(upgraded, 0, UPGRADE_ALIGN_HEAD_BYTES)
++        val source = AudioCache.renditionAt(playingUri) ?: return null
++        val target = AudioCache.renditionAt(upgraded) ?: return null
++        if (source.cachedPrefix < AudioCache.MIN_ALIGNMENT_PREFIX_BYTES ||
++            target.cachedPrefix < AudioCache.MIN_ALIGNMENT_PREFIX_BYTES
++        ) {
++            return null
++        }
++        return VersionAudioAligner.findRenditionOffsetMs(
++            AudioCache.renditionDataSource(playingUri, source),
++            AudioCache.renditionDataSource(upgraded, target),
++            mediaId,
++        )?.takeIf { abs(it) <= 5_000L }
++    }
++
+     /** Fork: failed alignments per track; see the re-seek in [seamlessSwapToStream]. */
+     private val alignmentMisses = HashMap<String, Int>()
+ 
+@@ -4718,12 +4741,22 @@ class PlaybackService : MediaLibraryService() {
+             return false
+         }
+ 
++        // Fork: where the same music sits in the upgrade's file. Masters often differ by a
++        // few hundred ms of leading silence, which a timestamp-for-timestamp swap plays as
++        // a jump back (or ahead). 0 when it can't be measured: the swap lands as before.
++        val offset = withTimeoutOrNull(UPGRADE_ALIGN_TIMEOUT_MS) {
++            measureUpgradeOffset(mediaId, Uri.parse(now.uri), upgradedUri)
++        } ?: 0L
++        if (player !== activePlayer || activePlayer.currentMediaItem?.mediaId != mediaId) return false
++
+         if (!canCrossfade || standbyPlayer == null) {
+             swappingMediaId = mediaId
+             swapCutAt = SystemClock.elapsedRealtime()
++            // Read before the replace (after it Media3 reports 0), and live rather than
++            // now.position — the measurement above took a second or two.
++            val at = activePlayer.currentPosition + offset
+             activePlayer.replaceMediaItem(currentIndex, upgradedItem)
+-            // now.position, as v1.8.1: after a replace with a new URI Media3 reports 0.
+-            activePlayer.seekTo(currentIndex, now.position)
++            activePlayer.seekTo(currentIndex, at)
+             activePlayer.prepare()
+             return true
+         }
+@@ -4745,7 +4778,7 @@ class PlaybackService : MediaLibraryService() {
+             // Fork: the active player's speed, which a kept mix tempo can make other than the setting.
+             standbyPlayer.setPlaybackSpeed(activePlayer.playbackParameters.speed)
+             standbyPlayer.volume = 0f
+-            standbyPlayer.setMediaItems(newItems, currentIndex, livePos)
++            standbyPlayer.setMediaItems(newItems, currentIndex, livePos + offset)
+             spareLoudness().track(mediaId, nextMediaIdOf(standbyPlayer))
+             standbyPlayer.playWhenReady = false
+             standbyPlayer.prepare()
+@@ -4807,7 +4840,7 @@ class PlaybackService : MediaLibraryService() {
+             val willPlay = wasPlaying && activePlayer.playWhenReady
+             // Fork: the offset the fade starts from; only a change in it means the listener sought.
+             var driftBaseline = 0L
+-            standbyPlayer.seekTo(currentIndex, activePlayer.currentPosition)
++            standbyPlayer.seekTo(currentIndex, activePlayer.currentPosition + offset)
+ 
+             if (willPlay) {
+                 standbyPlayer.play()
+@@ -4816,7 +4849,7 @@ class PlaybackService : MediaLibraryService() {
+                     delay(10)
+                 }
+                 if (standbyPlayer.isPlaying) {
+-                    standbyPlayer.seekTo(currentIndex, activePlayer.currentPosition)
++                    standbyPlayer.seekTo(currentIndex, activePlayer.currentPosition + offset)
+                     val resyncTimeout = SystemClock.elapsedRealtime() + 300L
+                     while (coroutineContext.isActive && standbyPlayer.playbackState != Player.STATE_READY && SystemClock.elapsedRealtime() < resyncTimeout) {
+                         delay(10)
+@@ -4841,7 +4874,7 @@ class PlaybackService : MediaLibraryService() {
+                     }
+                 }
+                 awaitMoving()
+-                val lag = activePlayer.currentPosition - standbyPlayer.currentPosition
++                val lag = activePlayer.currentPosition + offset - standbyPlayer.currentPosition
+                 TrackLog.d("BitChord", "upgrade crossfade: standby ${lag}ms behind before compensation", about = mediaId)
+                 // Fork: the lag above is the standby's start-up, not the cost of a seek — a
+                 // second seek into buffered audio lands at once, so adding the lag overshot by
+@@ -4849,10 +4882,10 @@ class PlaybackService : MediaLibraryService() {
+                 // Re-seek to where the active player is now, and fade once within 300ms — or
+                 // anyway on the third miss for this track: a short flam beats never upgrading.
+                 if (abs(lag) in 15L..3_000L) {
+-                    standbyPlayer.seekTo(currentIndex, activePlayer.currentPosition)
++                    standbyPlayer.seekTo(currentIndex, activePlayer.currentPosition + offset)
+                     awaitMoving()
+                 }
+-                val residual = activePlayer.currentPosition - standbyPlayer.currentPosition
++                val residual = activePlayer.currentPosition + offset - standbyPlayer.currentPosition
+                 if (abs(residual) > 300L) {
+                     // ponytail: never pruned; one entry per track that missed, for the process's life
+                     val misses = (alignmentMisses[mediaId] ?: 0) + 1
+@@ -4889,7 +4922,7 @@ class PlaybackService : MediaLibraryService() {
+                         if (!stillWanted()) return false
+ 
+                         // Check for user seeking / scrubbing during the crossfade
+-                        if (abs(activePlayer.currentPosition - standbyPlayer.currentPosition - driftBaseline) > 300L) {
++                        if (abs(activePlayer.currentPosition + offset - standbyPlayer.currentPosition - driftBaseline) > 300L) {
+                             TrackLog.d(
+                                 "BitChord",
+                                 "user sought during upgrade crossfade; aborting swap " +
+@@ -9376,6 +9409,9 @@ class PlaybackService : MediaLibraryService() {
+          * range that stops short of the first frame buys nothing at all.
+          */
+         const val UPGRADE_HEADER_BYTES = 1L * 1024 * 1024
++        /** Fork: head of the upgrade's file fetched for alignment, and how long measuring may take. */
++        const val UPGRADE_ALIGN_HEAD_BYTES = 3L * 1024 * 1024
++        const val UPGRADE_ALIGN_TIMEOUT_MS = 4_000L
+ 
+         /** Loaded media bytes an audition needs before its buffered position is believed. */
+         const val MIN_PROVEN_LOAD_BYTES = UPGRADE_HEADER_BYTES
+diff --git a/app/src/main/java/com/music/bitchord/playback/smart/VersionAudioAligner.kt b/app/src/main/java/com/music/bitchord/playback/smart/VersionAudioAligner.kt
+index 2b18c36..1b2e16c 100644
+--- a/app/src/main/java/com/music/bitchord/playback/smart/VersionAudioAligner.kt
++++ b/app/src/main/java/com/music/bitchord/playback/smart/VersionAudioAligner.kt
+@@ -512,4 +512,42 @@ object VersionAudioAligner {
+             }
+         }
+     }
++
++    /**
++     * Fork: the shift from one cached rendition of a track to another — a quality
++     * upgrade's FLAC against the YouTube copy playing — so the swap lands on the same
++     * musical moment rather than the same timestamp. Same contract as [findOffsetMs]
++     * (target = source + offset, null when it can't be trusted). Not cached: the pair is
++     * per upgrade, and closes both sources.
++     */
++    suspend fun findRenditionOffsetMs(source: MediaDataSource, target: MediaDataSource, about: String): Long? =
++        withContext(Dispatchers.IO) {
++            try {
++                val (s, t) = coroutineScope {
++                    val a = async(Dispatchers.IO) { AudioDecoder.decodeRegion(source, 0.0, 30.0) }
++                    val b = async(Dispatchers.IO) { AudioDecoder.decodeRegion(target, 0.0, 30.0) }
++                    a.await() to b.await()
++                }
++                if (s == null || t == null || s.first.samples.isEmpty() || t.first.samples.isEmpty()) {
++                    return@withContext null
++                }
++                val c = crossCorrelate(
++                    computeEnergyEnvelope(s.first.samples, s.first.sampleRate),
++                    computeEnergyEnvelope(t.first.samples, t.first.sampleRate),
++                )
++                if (c.confidence < MIN_CONFIDENCE || c.lagFrames == c.floor || c.lagFrames == c.ceiling) {
++                    TrackLog.d(TAG, "upgrade alignment not trusted: conf=${c.confidence} lag=${c.lagFrames} (${c.floor}..${c.ceiling})", about)
++                    return@withContext null
++                }
++                ((c.lagFrames * HOP_MS).toLong() + ((t.second - s.second) * 1000.0).toLong()).also {
++                    TrackLog.d(TAG, "upgrade alignment: ${it}ms (conf=${c.confidence})", about)
++                }
++            } catch (e: Exception) {
++                TrackLog.w(TAG, "upgrade alignment failed: ${e.message}", about)
++                null
++            } finally {
++                safeClose(source)
++                safeClose(target)
++            }
++        }
+ }

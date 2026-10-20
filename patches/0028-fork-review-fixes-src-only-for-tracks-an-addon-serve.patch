@@ -1,0 +1,264 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 14:28:58 +0300
+Subject: [PATCH 28/29] =?UTF-8?q?fork:=20review=20fixes=20=E2=80=94=20#src?=
+ =?UTF-8?q?=20only=20for=20tracks=20an=20addon=20served=20and=20never=20of?=
+ =?UTF-8?q?fline;=20measure=20the=20upgrade=20offset=20before=20swapIn's?=
+ =?UTF-8?q?=20checks;=20fade=20only=20within=201s,=20give=20up=20after=205?=
+ =?UTF-8?q?=20misses;=20cancellable=20read-ahead=20pulls=20and=20decodes?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ .../com/music/bitchord/playback/AudioCache.kt | 63 +++++++++++++++----
+ .../bitchord/playback/PlaybackService.kt      | 43 +++++++++----
+ .../playback/smart/VersionAudioAligner.kt     |  6 +-
+ 3 files changed, 87 insertions(+), 25 deletions(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+index 1555cf2..0de92fb 100644
+--- a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
++++ b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+@@ -34,16 +34,17 @@ import com.music.bitchord.data.sources.SourceResolver
+ import com.music.bitchord.data.sources.TrackMatcher
+ import com.music.bitchord.download.Downloads
+ import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.CoroutineStart
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.Job
+ import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.awaitCancellation
+ import kotlinx.coroutines.delay
+ import kotlinx.coroutines.ensureActive
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.StateFlow
+ import kotlinx.coroutines.flow.asStateFlow
+ import kotlinx.coroutines.isActive
+-import kotlinx.coroutines.job
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.withContext
+ import okhttp3.Request
+@@ -470,8 +471,14 @@ object AudioCache {
+                 val rendition = QualityUpgrade.cacheTag(spec.uri)
+                 when {
+                     rendition != null -> "$videoId#$rendition"
+-                    SourceResolver.canSubstituteForYouTube() ->
+-                        substituteKey(videoId).let { completeSibling(videoId, it) ?: it }
++                    SourceResolver.canSubstituteForYouTube() -> {
++                        val key = substituteKey(videoId)
++                        // Fork: an offline fallback is kept for the process, so a reconnect
++                        // cannot move a playing track to an empty key (two files, one decoder).
++                        completeSibling(videoId, key)
++                            ?.also { substituteKeys["$videoId$ALT_SUFFIX${atmosKeySuffix()}"] = it }
++                            ?: key
++                    }
+                     else -> completeSibling(videoId, videoId) ?: videoId
+                 }
+             }
+@@ -536,10 +543,18 @@ object AudioCache {
+ 
+     private fun substituteKey(videoId: String): String {
+         val alt = "$videoId$ALT_SUFFIX${atmosKeySuffix()}"
++        val src = "$videoId#src${atmosKeySuffix()}"
+         return substituteKeys.getOrPut(alt) {
+-            val stale = ::cache.isInitialized &&
+-                runCatching { cache.getCachedSpans(alt).isNotEmpty() && isKeptOrigin(alt) }.getOrDefault(false)
+-            if (stale) "$videoId#src${atmosKeySuffix()}" else alt
++            // A #src holding a kept copy stays in use (else it is orphaned and downloaded
++            // again). Otherwise only a YouTube copy of a track an addon has served moves
++            // (see [recordServed]), and never offline, where #alt is all there is.
++            val moved = ::cache.isInitialized && runCatching {
++                cache.getCachedSpans(src).isNotEmpty() ||
++                    (cache.getCachedSpans(alt).isNotEmpty() &&
++                        cache.getContentMetadata(alt).get(META_ADDON_HAS, null as String?) != null &&
++                        !isOffline())
++            }.getOrDefault(false)
++            if (moved) src else alt
+         }
+     }
+ 
+@@ -548,9 +563,15 @@ object AudioCache {
+         // Ahead of the connectivity check, which is a binder call: nearly every
+         // open is of an entry that already holds something.
+         if (cache.getCachedSpans(preferred).isNotEmpty()) return null
+-        val siblings = listOf(videoId, "$videoId$ALT_SUFFIX", "$videoId$ALT_SUFFIX-noatmos")
+-            .filter { it != preferred }
+-        if (isOffline()) return siblings.firstOrNull(::isComplete)
++        val siblings = listOf(
++            videoId, "$videoId$ALT_SUFFIX", "$videoId$ALT_SUFFIX-noatmos", "$videoId#src", "$videoId#src-noatmos",
++        ).filter { it != preferred }
++        if (isOffline()) {
++            return siblings.firstOrNull(::isComplete)
++                // Fork: the copy an empty #src was moved away from plays as far as it goes.
++                ?: "$videoId$ALT_SUFFIX${atmosKeySuffix()}"
++                    .takeIf { preferred.contains("#src") && cache.getCachedSpans(it).isNotEmpty() }
++        }
+         if (preferred != videoId) return null
+         return siblings.firstOrNull { key -> isComplete(key) && isKeptOrigin(key) }
+     }
+@@ -748,6 +769,17 @@ object AudioCache {
+         val mediaId = mediaIdIn(spec.uri) ?: return
+         val key = spec.key ?: keyFactory.buildCacheKey(spec)
+         val origin = originOf(spec.uri, mediaId, servedUrl)
++        // Fork: an addon has this track, so a YouTube copy kept under #alt is what makes its
++        // replays start lossy; [substituteKey] moves it to #src. Tracks no addon has stay put.
++        if (origin == Origin.OTHER) runCatching {
++            val alt = "$mediaId$ALT_SUFFIX${atmosKeySuffix()}"
++            val meta = cache.getContentMetadata(alt)
++            if (alt != key && meta.get(META_ADDON_HAS, null as String?) == null &&
++                meta.get(META_ORIGIN, null as String?) == Origin.YOUTUBE.name
++            ) {
++                cache.applyContentMetadataMutations(alt, ContentMetadataMutations().set(META_ADDON_HAS, "1"))
++            }
++        }
+         val song = notedSongs[mediaId]
+         // Automix's analysis-only read: its own YouTube Opus download, made
+         // whatever the track is actually playing from. Never playback.
+@@ -1110,6 +1142,7 @@ object AudioCache {
+ 
+     /** Set once the player has played the track from this entry. */
+     private const val META_PLAYED = "bc_played"
++    private const val META_ADDON_HAS = "bc_addon_has"
+     private const val MAX_NOTED_SONGS = 256
+     private const val COPY_BUFFER_BYTES = 64 * 1024
+ 
+@@ -2327,11 +2360,19 @@ object AudioCache {
+             withContext(Dispatchers.IO) {
+                 // CacheWriter blocks in a read loop and checks this flag between
+                 // reads; cancelling the coroutine alone would leave it running.
+-                val handle = coroutineContext.job.invokeOnCompletion { writer.cancel() }
++                // Fork: a child, not invokeOnCompletion, which only fires once this
++                // job has completed, and the blocked body never lets it complete.
++                val stop = launch(start = CoroutineStart.UNDISPATCHED) {
++                    try {
++                        awaitCancellation()
++                    } finally {
++                        writer.cancel()
++                    }
++                }
+                 try {
+                     writer.cache()
+                 } finally {
+-                    handle.dispose()
++                    stop.cancel()
+                 }
+             }
+         }.onFailure {
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index 622c869..308a325 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -4715,6 +4715,7 @@ class PlaybackService : MediaLibraryService() {
+         upgradedItem: MediaItem,
+         upgradedUri: String,
+         stream: SourceStream,
++        offset: Long,
+     ): Boolean {
+         val mediaId = now.item.mediaId
+         val activePlayer = player ?: return false
+@@ -4741,19 +4742,10 @@ class PlaybackService : MediaLibraryService() {
+             return false
+         }
+ 
+-        // Fork: where the same music sits in the upgrade's file. Masters often differ by a
+-        // few hundred ms of leading silence, which a timestamp-for-timestamp swap plays as
+-        // a jump back (or ahead). 0 when it can't be measured: the swap lands as before.
+-        val offset = withTimeoutOrNull(UPGRADE_ALIGN_TIMEOUT_MS) {
+-            measureUpgradeOffset(mediaId, Uri.parse(now.uri), upgradedUri)
+-        } ?: 0L
+-        if (player !== activePlayer || activePlayer.currentMediaItem?.mediaId != mediaId) return false
+-
+         if (!canCrossfade || standbyPlayer == null) {
+             swappingMediaId = mediaId
+             swapCutAt = SystemClock.elapsedRealtime()
+-            // Read before the replace (after it Media3 reports 0), and live rather than
+-            // now.position — the measurement above took a second or two.
++            // Read before the replace (after it Media3 reports 0).
+             val at = activePlayer.currentPosition + offset
+             activePlayer.replaceMediaItem(currentIndex, upgradedItem)
+             activePlayer.seekTo(currentIndex, at)
+@@ -4810,6 +4802,7 @@ class PlaybackService : MediaLibraryService() {
+                 standbyPlayer.shuffleModeEnabled = activePlayer.shuffleModeEnabled
+                 adoptPlayerForVersionSwap(outgoing = activePlayer, incoming = standbyPlayer, isSameTrack = true)
+                 adopted = true
++                alignmentMisses.remove(mediaId)
+             }
+ 
+             val timeoutAt = SystemClock.elapsedRealtime() + 5_000L
+@@ -4890,8 +4883,15 @@ class PlaybackService : MediaLibraryService() {
+                     // ponytail: never pruned; one entry per track that missed, for the process's life
+                     val misses = (alignmentMisses[mediaId] ?: 0) + 1
+                     alignmentMisses[mediaId] = misses
+-                    if (misses < 3) {
++                    // Past 1s it is a seek in the window or a stalled/unseekable standby, not
++                    // alignment: fading into it would undo the seek or restart the song.
++                    if (misses < 3 || abs(residual) > 1_000L || !standbyPlayer.isPlaying) {
+                         TrackLog.d("BitChord", "upgrade crossfade: standby still ${residual}ms off (miss $misses); waiting for the re-offer", about = mediaId)
++                        // ponytail: 5 misses ends the 5s re-offer loop for this track this session
++                        if (misses >= 5) {
++                            QualityUpgrade.forget(mediaId)
++                            QualityUpgrade.refuseUpgrades(mediaId)
++                        }
+                         return false
+                     }
+                     TrackLog.d("BitChord", "upgrade crossfade: standby still ${residual}ms off after $misses tries; fading anyway", about = mediaId)
+@@ -5008,6 +5008,23 @@ class PlaybackService : MediaLibraryService() {
+             return
+         }
+ 
++        // Fork: where the same music sits in the upgrade's file. Masters often differ by a
++        // few hundred ms of leading silence, which a timestamp-for-timestamp swap plays as
++        // a jump back (or ahead). 0 when it can't be measured: the swap lands as before.
++        // Measured here so the block below re-checks everything after it with no suspension
++        // before the swap; as an audition so a skip shelves the proof there instead of
++        // cancelling it, and the warm claims no format. Not in a party: the host would move.
++        val offset = if (ListenTogether.state.value.inParty) 0L else {
++            QualityUpgrade.beginAudition(mediaId)
++            try {
++                withTimeoutOrNull(UPGRADE_ALIGN_TIMEOUT_MS) {
++                    measureUpgradeOffset(mediaId, Uri.parse(at.uri), upgradedUri)
++                } ?: 0L
++            } finally {
++                QualityUpgrade.endAudition(mediaId)
++            }
++        }
++
+         // There used to be an unconditional five-second hold here, keyed off the
+         // track's own position, so that an upgrade arriving with the first note
+         // could not cut the song a millisecond in. Its own reasoning said it was
+@@ -5139,7 +5156,9 @@ class PlaybackService : MediaLibraryService() {
+                 .withResolvedStreamType(stream.url)
+                 .build()
+ 
+-            val swapped = seamlessSwapToStream(now, upgradedItem, upgradedUri, stream)
++            val swapped = seamlessSwapToStream(
++                now, upgradedItem, upgradedUri, stream, if (now.uri == at.uri) offset else 0L,
++            )
+             if (!swapped) return@withContext
+ 
+             val upgradedSourceName = stream.sourceConfigId?.let { SourceRegistry.config(it)?.displayName }
+diff --git a/app/src/main/java/com/music/bitchord/playback/smart/VersionAudioAligner.kt b/app/src/main/java/com/music/bitchord/playback/smart/VersionAudioAligner.kt
+index 1b2e16c..4eedac8 100644
+--- a/app/src/main/java/com/music/bitchord/playback/smart/VersionAudioAligner.kt
++++ b/app/src/main/java/com/music/bitchord/playback/smart/VersionAudioAligner.kt
+@@ -12,6 +12,7 @@ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.async
+ import kotlinx.coroutines.coroutineScope
+ import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.isActive
+ import kotlinx.coroutines.withContext
+ import java.util.concurrent.ConcurrentHashMap
+ import java.util.concurrent.atomic.AtomicLong
+@@ -524,8 +525,9 @@ object VersionAudioAligner {
+         withContext(Dispatchers.IO) {
+             try {
+                 val (s, t) = coroutineScope {
+-                    val a = async(Dispatchers.IO) { AudioDecoder.decodeRegion(source, 0.0, 30.0) }
+-                    val b = async(Dispatchers.IO) { AudioDecoder.decodeRegion(target, 0.0, 30.0) }
++                    // Fork: abortable, or the caller's timeout waits out both decodes.
++                    val a = async(Dispatchers.IO) { AudioDecoder.decodeRegion(source, 0.0, 30.0) { !isActive } }
++                    val b = async(Dispatchers.IO) { AudioDecoder.decodeRegion(target, 0.0, 30.0) { !isActive } }
+                     a.await() to b.await()
+                 }
+                 if (s == null || t == null || s.first.samples.isEmpty() || t.first.samples.isEmpty()) {
