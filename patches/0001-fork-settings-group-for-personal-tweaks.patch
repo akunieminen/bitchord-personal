@@ -1,0 +1,211 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 10:25:02 +0300
+Subject: [PATCH 01/16] fork: settings group for personal tweaks
+
+---
+ .../com/music/bitchord/BitChordApplication.kt |  1 +
+ .../bitchord/data/settings/ForkSettings.kt    | 65 +++++++++++++
+ .../bitchord/ui/screens/ForkTweaksGroup.kt    | 95 +++++++++++++++++++
+ .../bitchord/ui/screens/SettingsSheet.kt      |  2 +
+ 4 files changed, 163 insertions(+)
+ create mode 100644 app/src/main/java/com/music/bitchord/data/settings/ForkSettings.kt
+ create mode 100644 app/src/main/java/com/music/bitchord/ui/screens/ForkTweaksGroup.kt
+
+diff --git a/app/src/main/java/com/music/bitchord/BitChordApplication.kt b/app/src/main/java/com/music/bitchord/BitChordApplication.kt
+index 0f4eb66..8d477b9 100644
+--- a/app/src/main/java/com/music/bitchord/BitChordApplication.kt
++++ b/app/src/main/java/com/music/bitchord/BitChordApplication.kt
+@@ -116,6 +116,7 @@ class BitChordApplication : Application(), SingletonImageLoader.Factory {
+             CoroutineScope(Dispatchers.IO).launch { Innertube.ensureSessionScope() }
+         }
+         AppSettings.init(this, authStore)
++        com.music.bitchord.data.settings.ForkSettings.init(this)
+         // Before anything resolves a track: an addon with `checkValidLossless`
+         // is gated on this, and the gate reads "no" until it has looked.
+         com.music.bitchord.playback.audio.LosslessOutput.init(this)
+diff --git a/app/src/main/java/com/music/bitchord/data/settings/ForkSettings.kt b/app/src/main/java/com/music/bitchord/data/settings/ForkSettings.kt
+new file mode 100644
+index 0000000..1ca6785
+--- /dev/null
++++ b/app/src/main/java/com/music/bitchord/data/settings/ForkSettings.kt
+@@ -0,0 +1,65 @@
++package com.music.bitchord.data.settings
++
++import android.content.Context
++import android.content.SharedPreferences
++import kotlinx.coroutines.flow.MutableStateFlow
++
++/**
++ * The personal fork's own switches, kept out of [AppSettings] so the fork's
++ * patches stay small against upstream. Not part of Export data.
++ */
++object ForkSettings {
++
++    private lateinit var prefs: SharedPreferences
++
++    class Toggle internal constructor(private val key: String, private val default: Boolean) {
++        val flow = MutableStateFlow(default)
++        val value: Boolean get() = flow.value
++
++        internal fun load() {
++            flow.value = prefs.getBoolean(key, default)
++        }
++
++        fun set(on: Boolean) {
++            flow.value = on
++            prefs.edit().putBoolean(key, on).apply()
++        }
++    }
++
++    /** Addon sources join JioSaavn in being asked about the next track ahead of time. */
++    val addonLookahead = Toggle("addon_lookahead", true)
++
++    /** The track after the next one is pinned too, so a skip or a crossfade's early preload finds it. */
++    val pinTwoAhead = Toggle("pin_two_ahead", true)
++
++    /** Read-ahead starts 2s into a track instead of 8s. */
++    val fastReadAhead = Toggle("fast_read_ahead", true)
++
++    /** A pause leaves read-ahead running instead of cancelling it. */
++    val prefetchWhilePaused = Toggle("prefetch_while_paused", true)
++
++    /** A track that arrived through a crossfade or Automix keeps its stream for that play. */
++    val noUpgradeAfterBlend = Toggle("no_upgrade_after_blend", true)
++
++    /**
++     * How long an unpinned track waits for a higher-ranked source before
++     * taking YouTube's stream. 0 is upstream's plain race.
++     */
++    val headStartMs = MutableStateFlow(DEFAULT_HEAD_START_MS)
++
++    fun setHeadStartMs(ms: Long) {
++        headStartMs.value = ms
++        prefs.edit().putLong(KEY_HEAD_START_MS, ms).apply()
++    }
++
++    fun init(context: Context) {
++        prefs = context.getSharedPreferences("bitchord_fork", Context.MODE_PRIVATE)
++        listOf(addonLookahead, pinTwoAhead, fastReadAhead, prefetchWhilePaused, noUpgradeAfterBlend)
++            .forEach { it.load() }
++        headStartMs.value = prefs.getLong(KEY_HEAD_START_MS, DEFAULT_HEAD_START_MS)
++    }
++
++    // ponytail: measured against one bridge (search 2.6s + stream 1.2s); tune on the slider.
++    private const val DEFAULT_HEAD_START_MS = 4_000L
++    private const val KEY_HEAD_START_MS = "head_start_ms"
++}
+diff --git a/app/src/main/java/com/music/bitchord/ui/screens/ForkTweaksGroup.kt b/app/src/main/java/com/music/bitchord/ui/screens/ForkTweaksGroup.kt
+new file mode 100644
+index 0000000..732d54b
+--- /dev/null
++++ b/app/src/main/java/com/music/bitchord/ui/screens/ForkTweaksGroup.kt
+@@ -0,0 +1,95 @@
++package com.music.bitchord.ui.screens
++
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.automirrored.rounded.QueueMusic
++import androidx.compose.material.icons.rounded.CloudDownload
++import androidx.compose.material.icons.rounded.HourglassTop
++import androidx.compose.material.icons.rounded.Pause
++import androidx.compose.material.icons.rounded.Speed
++import androidx.compose.material.icons.rounded.Waves
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Switch
++import androidx.compose.material3.SwitchDefaults
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.ui.graphics.vector.ImageVector
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import com.music.bitchord.data.settings.ForkSettings
++import java.util.Locale
++
++/** The personal fork's switches — see [ForkSettings]. English only, on purpose: no strings.xml to conflict on. */
++@Composable
++internal fun ForkTweaksGroup() {
++    SettingsGroup(
++        header = "Fork tweaks",
++        footer = "Personal build. These change how hi-res copies from addons are found and swapped in.",
++    ) {
++        ToggleRow(
++            Icons.Rounded.CloudDownload,
++            "Addon lookahead",
++            "Find the next song's hi-res copy while this one plays",
++            ForkSettings.addonLookahead,
++        )
++        RowDivider()
++        ToggleRow(
++            Icons.AutoMirrored.Rounded.QueueMusic,
++            "Look two songs ahead",
++            "Also find the song after next, so skips and mixes start hi-res",
++            ForkSettings.pinTwoAhead,
++        )
++        RowDivider()
++        ToggleRow(
++            Icons.Rounded.Speed,
++            "Fast read-ahead",
++            "Start downloading the next song 2s into this one instead of 8s",
++            ForkSettings.fastReadAhead,
++        )
++        RowDivider()
++        ToggleRow(
++            Icons.Rounded.Pause,
++            "Read ahead while paused",
++            "Keep downloading the next song when playback is paused",
++            ForkSettings.prefetchWhilePaused,
++        )
++        RowDivider()
++        ToggleRow(
++            Icons.Rounded.Waves,
++            "No swap after a mix",
++            "A song that crossfaded in keeps its stream instead of cutting to a better copy",
++            ForkSettings.noUpgradeAfterBlend,
++        )
++        RowDivider()
++        val headStart by ForkSettings.headStartMs.collectAsStateWithLifecycle()
++        SliderRow(
++            icon = Icons.Rounded.HourglassTop,
++            title = "Wait for hi-res",
++            subtitle = "How long a tapped song waits for the addon before starting on YouTube",
++            value = if (headStart == 0L) "Off" else String.format(Locale.ROOT, "%.1fs", headStart / 1000f),
++            sliderValue = headStart / 1000f,
++            onSliderValue = { ForkSettings.setHeadStartMs((it * 2).toInt() * 500L) },
++            valueRange = 0f..8f,
++            steps = 15,
++        )
++    }
++}
++
++@Composable
++private fun ToggleRow(icon: ImageVector, title: String, subtitle: String, toggle: ForkSettings.Toggle) {
++    val on by toggle.flow.collectAsStateWithLifecycle()
++    SettingsRow(
++        icon = icon,
++        title = title,
++        subtitle = subtitle,
++        trailing = {
++            Switch(
++                checked = on,
++                onCheckedChange = toggle::set,
++                colors = SwitchDefaults.colors(
++                    checkedTrackColor = MaterialTheme.colorScheme.primary,
++                    checkedBorderColor = MaterialTheme.colorScheme.primary,
++                ),
++            )
++        },
++        onClick = { toggle.set(!on) },
++    )
++}
+diff --git a/app/src/main/java/com/music/bitchord/ui/screens/SettingsSheet.kt b/app/src/main/java/com/music/bitchord/ui/screens/SettingsSheet.kt
+index edf23a4..f6b7107 100644
+--- a/app/src/main/java/com/music/bitchord/ui/screens/SettingsSheet.kt
++++ b/app/src/main/java/com/music/bitchord/ui/screens/SettingsSheet.kt
+@@ -759,6 +759,8 @@ fun SettingsScreen(
+             }
+         }
+ 
++        if (searchQuery.isBlank()) ForkTweaksGroup()
++
+         SearchableSettingsGroup(search, header = stringResource(R.string.appearance)) {
+             val themeTitle = stringResource(R.string.theme)
+             row(themeTitle, "dark mode", "light mode") {

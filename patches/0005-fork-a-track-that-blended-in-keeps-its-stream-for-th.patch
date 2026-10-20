@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 10:27:49 +0300
+Subject: [PATCH 05/16] fork: a track that blended in keeps its stream for that
+ play
+
+---
+ .../com/music/bitchord/playback/PlaybackService.kt    | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index bcdf035..bafb812 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -3558,6 +3558,7 @@ class PlaybackService : MediaLibraryService() {
+         // ExoPlayer preparing the next item while this one played, so
+         // it is pending by now; the ones that aren't are picked up by
+         // the sampler in [reportProgress].
++        blendedIn = mediaItem?.mediaId?.takeIf { alreadyAudible && reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO }
+         cancelStaleUpgradeJob()
+         lookForBetterCopy(exoPlayer)
+         // Covers crossfades too: a blended advance never reaches
+@@ -3570,6 +3571,11 @@ class PlaybackService : MediaLibraryService() {
+     /** The background hunt for a better copy of whatever is playing. */
+     private var upgradeJob: Job? = null
+ 
++    // ponytail: a track that arrived inside a crossfade/Automix keeps its
++    // stream for this play; an automatic swap would cut the mix that just
++    // landed. "Upgrade quality" by hand clears it.
++    private var blendedIn: String? = null
++
+     /** Which track [upgradeJob] is hunting for — see [lookForBetterCopy]. */
+     private var upgradeFor: String? = null
+ 
+@@ -4267,6 +4273,10 @@ class PlaybackService : MediaLibraryService() {
+         val alreadyPending = QualityUpgrade.isPending(mediaId)
+         val shelved = QualityUpgrade.shelvedFor(mediaId)
+         if (shelved == null && !alreadyPending && !QualityUpgrade.couldStillUpgrade(mediaId, uri)) return
++        if (ForkSettings.noUpgradeAfterBlend.value && mediaId == blendedIn) {
++            NerdStats.onLosslessRaceEnd(mediaId)
++            return
++        }
+         if (upgradeJob?.isActive == true) {
+             // Already hunting for this track. One left over from a track the
+             // queue has moved past is a different matter: it can only come
+@@ -4410,6 +4420,7 @@ class PlaybackService : MediaLibraryService() {
+         SourceRegistry.clearCompletedAddonTrackCalls()
+         QualityUpgrade.askByHand(mediaId)
+         TrackLog.d("BitChord", "upgrade asked for by hand for $mediaId", about = mediaId)
++        blendedIn = null
+         lookForBetterCopy(player)
+     }
+ 

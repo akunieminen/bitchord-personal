@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 10:28:52 +0300
+Subject: [PATCH 11/16] fork: seamless source crossfade on by default
+
+---
+ .../java/com/music/bitchord/data/settings/AppSettings.kt    | 4 ++--
+ .../java/com/music/bitchord/SourceCrossfadeSettingsTest.kt  | 6 +++---
+ 2 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/data/settings/AppSettings.kt b/app/src/main/java/com/music/bitchord/data/settings/AppSettings.kt
+index 980756c..238378c 100644
+--- a/app/src/main/java/com/music/bitchord/data/settings/AppSettings.kt
++++ b/app/src/main/java/com/music/bitchord/data/settings/AppSettings.kt
+@@ -400,7 +400,7 @@ object AppSettings {
+     val smartVersionAlignment = MutableStateFlow(true)
+ 
+     /** Enables micro-crossfade across dual players when swapping audio sources mid-playback. */
+-    val sourceCrossfadeEnabled = MutableStateFlow(false)
++    val sourceCrossfadeEnabled = MutableStateFlow(true) // fork: on by default
+ 
+     /** Drops haze blur (status bar, mini player, bottom fade, lyrics focus) for a solid-fill look. */
+     val reduceDynamicBlur = MutableStateFlow(false)
+@@ -871,7 +871,7 @@ object AppSettings {
+         dontRepeatSuggestions.value = prefs.getBoolean(KEY_DONT_REPEAT_SUGGESTIONS, false)
+         preferMusicOnly.value = prefs.getBoolean(KEY_PREFER_MUSIC_ONLY, false)
+         smartVersionAlignment.value = prefs.getBoolean(KEY_SMART_VERSION_ALIGNMENT, true)
+-        sourceCrossfadeEnabled.value = prefs.getBoolean(KEY_SOURCE_CROSSFADE, false)
++        sourceCrossfadeEnabled.value = prefs.getBoolean(KEY_SOURCE_CROSSFADE, true)
+         reduceDynamicBlur.value = prefs.getBoolean(KEY_REDUCE_BLUR, false)
+         liquidGlass.value = prefs.getBoolean(KEY_LIQUID_GLASS, false)
+         lyricsBlur.value = prefs.getBoolean(KEY_LYRICS_BLUR, true)
+diff --git a/app/src/test/java/com/music/bitchord/SourceCrossfadeSettingsTest.kt b/app/src/test/java/com/music/bitchord/SourceCrossfadeSettingsTest.kt
+index d067e0b..b7beca3 100644
+--- a/app/src/test/java/com/music/bitchord/SourceCrossfadeSettingsTest.kt
++++ b/app/src/test/java/com/music/bitchord/SourceCrossfadeSettingsTest.kt
+@@ -1,13 +1,13 @@
+ package com.music.bitchord
+ 
+ import com.music.bitchord.data.settings.AppSettings
+-import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
+ import org.junit.Test
+ 
+ class SourceCrossfadeSettingsTest {
+ 
+     @Test
+-    fun `source crossfade defaults to false`() {
+-        assertFalse(AppSettings.sourceCrossfadeEnabled.value)
++    fun `source crossfade defaults to true in the fork`() {
++        assertTrue(AppSettings.sourceCrossfadeEnabled.value)
+     }
+ }

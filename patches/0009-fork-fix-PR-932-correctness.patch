@@ -1,0 +1,171 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 10:22:46 +0300
+Subject: [PATCH 09/16] fork: fix PR 932 correctness
+
+---
+ .../bitchord/playback/PlaybackService.kt      | 96 ++++++++++++++-----
+ 1 file changed, 70 insertions(+), 26 deletions(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index b89c7c4..da907eb 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -2052,6 +2052,18 @@ class PlaybackService : MediaLibraryService() {
+             TrackLog.d("BitChord", "version swap deferred: Automix is mid-transition", about = currentItem.mediaId)
+             return
+         }
++        // Nor while a quality upgrade owns the standby. It lets go within ~1-2s, so run
++        // this right after rather than dropping a switch the listener asked for.
++        if (sourceSwapActive) {
++            TrackLog.d("BitChord", "version swap deferred: a quality upgrade owns the standby", about = currentItem.mediaId)
++            scope.launch {
++                while (sourceSwapActive) delay(50)
++                if (player?.currentMediaItem?.mediaId == currentItem.mediaId) {
++                    smoothSwapCurrentTrackVersion(targetMediaItem, onSwapCommitted)
++                }
++            }
++            return
++        }
+ 
+         val sourceSong = currentItem.toSong()
+         val targetSong = targetMediaItem.toSong()
+@@ -2429,7 +2441,9 @@ class PlaybackService : MediaLibraryService() {
+         refreshCustomLayouts()
+ 
+         if (isSameTrack) {
+-            currentAudioInputFormat = null
++            // Its format event fired before formatListener moved here; read it off the player.
++            currentAudioInputFormat = incoming.audioFormat
++            applyOutputRoute()
+             activeTrackIsDolbyAtmos = NerdStats.declaredFormat(incoming.currentMediaItem?.mediaId)?.isDolbyAtmos == true
+             applySpatialAudioEnabled()
+             publishNerdStats()
+@@ -4586,14 +4600,27 @@ class PlaybackService : MediaLibraryService() {
+         val canCrossfade = standbyPlayer != null &&
+             AppSettings.sourceCrossfadeEnabled.value &&
+             (activePlayer.isPlaying || activePlayer.playbackState == Player.STATE_READY) &&
++            // A call or other transient focus loss: the standby has no focus handling and would be heard over it.
++            activePlayer.playbackSuppressionReason == Player.PLAYBACK_SUPPRESSION_REASON_NONE &&
+             crossfade?.isTransitioning() != true &&
+             !ListenTogether.state.value.inParty
+ 
++        // Busy rather than unable: a version swap owns the standby, or an Advanced Automix
++        // tempo ease-back is still running. Neither share it nor hard-cut under it; the
++        // next progress tick re-offers the shelved stream.
++        if (canCrossfade && (versionSwapJob?.isActive == true ||
++                abs(activePlayer.playbackParameters.speed - AppSettings.playbackSpeed.value) > 0.001f)
++        ) {
++            QualityUpgrade.shelve(mediaId, stream)
++            return false
++        }
++
+         if (!canCrossfade || standbyPlayer == null) {
+             swappingMediaId = mediaId
+             swapCutAt = SystemClock.elapsedRealtime()
+             activePlayer.replaceMediaItem(currentIndex, upgradedItem)
+-            activePlayer.seekTo(currentIndex, activePlayer.currentPosition)
++            // now.position, as v1.8.1: after a replace with a new URI Media3 reports 0.
++            activePlayer.seekTo(currentIndex, now.position)
+             activePlayer.prepare()
+             return true
+         }
+@@ -4619,15 +4646,39 @@ class PlaybackService : MediaLibraryService() {
+             standbyPlayer.playWhenReady = false
+             standbyPlayer.prepare()
+ 
++            // Everything swapIn checked once is re-checked here, because this suspends:
++            // a skip, a revert (pin + new URI, same mediaId and index), a recovery that
++            // dropped the parked stream, or a call can all land in between.
++            // swapPointFor covers the player, current item, pin and marker.
++            fun stillWanted() = player === activePlayer &&
++                activePlayer.currentMediaItemIndex == currentIndex &&
++                swapPointFor(mediaId)?.uri == now.uri &&
++                QualityUpgrade.forcedStream(Uri.parse(upgradedUri)) != null &&
++                activePlayer.playbackSuppressionReason == Player.PLAYBACK_SUPPRESSION_REASON_NONE
++
++            // Main thread, no suspension until adoptPlayerForVersionSwap: queue edits made
++            // while this buffered (AutoPlay append, Play next, remove/move) are carried
++            // over instead of being dropped with the outgoing player.
++            fun adopt() {
++                val live = (0 until activePlayer.mediaItemCount).map(activePlayer::getMediaItemAt)
++                val tail = live.subList(currentIndex + 1, live.size)
++                if (tail != newItems.subList(currentIndex + 1, newItems.size)) {
++                    standbyPlayer.replaceMediaItems(currentIndex + 1, standbyPlayer.mediaItemCount, tail)
++                }
++                val head = live.subList(0, currentIndex)
++                if (head != newItems.subList(0, currentIndex)) {
++                    standbyPlayer.replaceMediaItems(0, currentIndex, head)
++                }
++                standbyPlayer.repeatMode = activePlayer.repeatMode
++                standbyPlayer.shuffleModeEnabled = activePlayer.shuffleModeEnabled
++                adoptPlayerForVersionSwap(outgoing = activePlayer, incoming = standbyPlayer, isSameTrack = true)
++                adopted = true
++            }
++
+             val timeoutAt = SystemClock.elapsedRealtime() + 5_000L
+             var isReady = false
+             while (coroutineContext.isActive && SystemClock.elapsedRealtime() < timeoutAt) {
+-                if (player !== activePlayer ||
+-                    activePlayer.currentMediaItemIndex != currentIndex ||
+-                    activePlayer.currentMediaItem?.mediaId != mediaId
+-                ) {
+-                    return false
+-                }
++                if (!stillWanted()) return false
+                 if (crossfade?.isTransitioning() == true) {
+                     QualityUpgrade.shelve(mediaId, stream)
+                     TrackLog.d("BitChord", "upgrade for $mediaId shelved: a crossfade started")
+@@ -4692,12 +4743,7 @@ class PlaybackService : MediaLibraryService() {
+                         val elapsed = SystemClock.elapsedRealtime() - fadeStart
+                         val progress = (elapsed.toFloat() / swapCrossfadeMs).coerceIn(0f, 1f)
+ 
+-                        if (player !== activePlayer ||
+-                            activePlayer.currentMediaItemIndex != currentIndex ||
+-                            activePlayer.currentMediaItem?.mediaId != mediaId
+-                        ) {
+-                            return false
+-                        }
++                        if (!stillWanted()) return false
+ 
+                         // Check for user seeking / scrubbing during the crossfade
+                         if (abs(activePlayer.currentPosition - standbyPlayer.currentPosition) > 300L) {
+@@ -4721,28 +4767,26 @@ class PlaybackService : MediaLibraryService() {
+                         delay(16)
+                     }
+ 
+-                    adoptPlayerForVersionSwap(
+-                        outgoing = activePlayer,
+-                        incoming = standbyPlayer,
+-                        isSameTrack = true,
+-                    )
+-                    adopted = true
++                    adopt()
+                 } finally {
+                     loudnessA.setBlendTrim(1f)
+                     loudnessB.setBlendTrim(1f)
+                 }
+             } else {
++                // Play pressed while this buffered: wasPlaying is stale, and adopting the
++                // paused standby would stop the music the listener just started.
++                if (!stillWanted() || activePlayer.playWhenReady) return false
+                 standbyPlayer.volume = 1f
+-                adoptPlayerForVersionSwap(
+-                    outgoing = activePlayer,
+-                    incoming = standbyPlayer,
+-                    isSameTrack = true,
+-                )
+-                adopted = true
++                adopt()
+             }
+             return true
+         } finally {
+             if (!adopted) {
++                // Proved and cached: keep it for the re-offer (skip, seek, abort), unless a
++                // recovery dropped the parked stream, which must stay dropped.
++                if (QualityUpgrade.forcedStream(Uri.parse(upgradedUri)) != null) {
++                    QualityUpgrade.shelve(mediaId, stream)
++                }
+                 standbyPlayer.stop()
+                 standbyPlayer.clearMediaItems()
+                 standbyPlayer.volume = 1f

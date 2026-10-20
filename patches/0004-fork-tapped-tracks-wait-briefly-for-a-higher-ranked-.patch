@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 10:27:30 +0300
+Subject: [PATCH 04/16] fork: tapped tracks wait briefly for a higher-ranked
+ source before YouTube
+
+---
+ .../java/com/music/bitchord/playback/PlaybackService.kt    | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index 3a432d7..bcdf035 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -5231,7 +5231,12 @@ class PlaybackService : MediaLibraryService() {
+         // are still looking — [lookup.isActive] below is what tells those
+         // apart, which is the question the old head start answered by timing
+         // out rather than by asking.
+-        val quick: SourceStream? = select {
++        // Fork: the modules get a head start after all — see
++        // [ForkSettings.headStartMs]. Unlike the one described above, YouTube is
++        // already resolving underneath, so a miss costs the wait and not a cold walk.
++        val headStart = ForkSettings.headStartMs.value
++        val early = if (headStart > 0) withTimeoutOrNull(headStart) { lookup.await() } else null
++        val quick: SourceStream? = early ?: select {
+             lookup.onAwait { it }
+             // A fallback that finished without a URL has not won anything.
+             //

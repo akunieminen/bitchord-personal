@@ -1,0 +1,189 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 10:26:03 +0300
+Subject: [PATCH 02/16] =?UTF-8?q?fork:=20addon=20lookahead=20=E2=80=94=20p?=
+ =?UTF-8?q?in=20next=20two=20tracks,=20first=20pin=20wins,=202s=20read-ahe?=
+ =?UTF-8?q?ad,=20read=20ahead=20while=20paused?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ .../bitchord/data/sources/SourceResolver.kt   |  6 +-
+ .../com/music/bitchord/playback/AudioCache.kt | 76 ++++++++++++++++---
+ .../bitchord/playback/PlaybackService.kt      |  8 +-
+ 3 files changed, 76 insertions(+), 14 deletions(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/data/sources/SourceResolver.kt b/app/src/main/java/com/music/bitchord/data/sources/SourceResolver.kt
+index 936999c..f4e382c 100644
+--- a/app/src/main/java/com/music/bitchord/data/sources/SourceResolver.kt
++++ b/app/src/main/java/com/music/bitchord/data/sources/SourceResolver.kt
+@@ -7,6 +7,7 @@ import com.music.bitchord.data.model.Song
+ import com.music.bitchord.data.settings.AppSettings
+ import com.music.bitchord.data.settings.AudioQuality
+ import com.music.bitchord.data.settings.DownloadQuality
++import com.music.bitchord.data.settings.ForkSettings
+ import kotlinx.coroutines.CancellationException
+ import kotlinx.coroutines.Deferred
+ import kotlinx.coroutines.async
+@@ -324,7 +325,10 @@ object SourceResolver {
+         if (target.title.isBlank() || target.isVideo) return null
+         val active = SourceRegistry.activeForPlayback()
+         val youtube = active.firstOrNull { it.kind == SourceKind.YOUTUBE } ?: return null
+-        val quick = rankedAbove(youtube.configId, active).filter { it.kind.worthPrefetching }
++        val quick = rankedAbove(youtube.configId, active).filter {
++            // Fork: addons too. Upstream keeps them out to spare shared servers a second lookup.
++            it.kind.worthPrefetching || (it.kind == SourceKind.ADDON && ForkSettings.addonLookahead.value)
++        }
+         if (quick.isEmpty()) return null
+         val (source, stream) = bestAcross(quick, target, requestForNow()) ?: return null
+         TrackLog.d(
+diff --git a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+index 694a8ce..04e0047 100644
+--- a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
++++ b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+@@ -25,6 +25,7 @@ import java.io.IOException
+ import com.music.bitchord.data.innertube.StreamResolver
+ import com.music.bitchord.data.model.Song
+ import com.music.bitchord.data.settings.AppSettings
++import com.music.bitchord.data.settings.ForkSettings
+ import com.music.bitchord.data.sources.DeviceCodecs
+ import com.music.bitchord.data.sources.SourceKind
+ import com.music.bitchord.data.sources.SourceRegistry
+@@ -163,6 +164,9 @@ object AudioCache {
+      */
+     private const val PREFETCH_DELAY_MS = 8_000L
+ 
++    // ponytail: fork — 2s gives up some of the opening burst the paragraph above protects; switch off if starts stall.
++    private val readAheadDelayMs: Long get() = if (ForkSettings.fastReadAhead.value) 2_000L else PREFETCH_DELAY_MS
++
+     /** How long to leave the player alone with an entry before trying again. */
+     private const val RETRY_DELAY_MS = 5_000L
+ 
+@@ -1273,33 +1277,39 @@ object AudioCache {
+                 // leaves nothing pinned, and this falls through to the same
+                 // URL-only warm-up it did before — YouTube resolves the track at
+                 // playback time as usual.
+-                val warmed = if (substitutable && target != null && !pinnedToYouTube) {
+-                    runCatching { SourceResolver.prefetchSubstitute(target) }
+-                        .onFailure { TrackLog.d(TAG, "warm-up substitute failed for $next: ${it.message}", about = next) }
+-                        .getOrNull()
+-                        ?.also { StreamChoice.remember(next, it, substituted = true) }
+-                } else {
+-                    null
+-                }
++                val warmed = substitutable && target != null && !pinnedToYouTube && pinSubstitute(next, target)
+                 // Safe to fill for the same reason in both cases: either nothing
+                 // outranks YouTube and read-ahead is the only writer, or a
+                 // source has been pinned and every writer now resolves to it.
+-                val cacheBytes = (!substitutable || warmed != null) && !pinnedToYouTube
++                val cacheBytes = (!substitutable || warmed) && !pinnedToYouTube
+                 if (cacheBytes) {
+                     launch(TrackLog.about(next)) {
+-                        delay(PREFETCH_DELAY_MS)
++                        delay(readAheadDelayMs)
+                         fetch(next, 0, PRELOAD_BYTES)
+                         fetchWhole(next)
+                     }
+                 }
++                // ponytail: the track after next is pinned too, URL only. Media3
++                // opens a player's next item as soon as its current one is fully
++                // buffered — seconds into an Opus or short track, and on a
++                // crossfade's standby before the handoff that brings this call
++                // round for it — and an unpinned open races to YouTube and books
++                // an upgrade cut. Same lookups per track as before (the head
++                // reuses this pin); a skip past it wastes one.
++                videoIds.getOrNull(1)?.let { after ->
++                    val afterTarget = upcoming.firstOrNull { it.mediaId == after }?.target
++                    if (ForkSettings.pinTwoAhead.value && substitutable && afterTarget != null && !OriginalVersion.isPinned(after)) {
++                        pinSubstitute(after, afterTarget)
++                    }
++                }
+                 launch {
+-                    delay(PREFETCH_DELAY_MS)
++                    delay(readAheadDelayMs)
+                     for (id in videoIds.take(QUEUE_LOOKAHEAD + 1).let { if (cacheBytes) it.drop(1) else it }) {
+                         // A track already pinned to another source has no use
+                         // for a YouTube URL: nothing will ask for one, and
+                         // minting it spends a client walk to fill a cache entry
+                         // that is never read.
+-                        if (id == next && warmed != null) continue
++                        if ((id == next && warmed) || StreamChoice.isSubstitute(id)) continue
+                         runCatching { StreamResolver.resolve(id) }
+                             .onFailure { TrackLog.d(TAG, "queue warm-up skipped $id: ${it.message}", about = id) }
+                         delay(QUEUE_RESOLVE_STAGGER_MS)
+@@ -1309,6 +1319,48 @@ object AudioCache {
+         }
+     }
+ 
++    /**
++     * Pins a quick source's copy of [id] in [StreamChoice], and says whether
++     * [id] is now held by a substitute.
++     *
++     * ponytail: the first pin wins. A player may already be filling `#alt`
++     * from the stream it was handed, and swapping the pin under it splices two
++     * files — what [StreamChoice] exists to stop. Check-then-put, not atomic;
++     * give StreamChoice a putIfAbsent if a flip ever shows in the log.
++     */
++    private suspend fun pinSubstitute(id: String, target: TrackMatcher.Target): Boolean {
++        StreamChoice.of(id)?.let { pinned ->
++            if (!StreamChoice.isSubstitute(id)) return false
++            // Re-stamped, so a pin made a track early doesn't age out before
++            // its own fade arms. Ceiling: the URL is then trusted up to a track
++            // past TTL_MS; a bridge whose URLs die sooner shows as a 403 on a
++            // re-open (a seek), not as a cut.
++            StreamChoice.remember(id, pinned, substituted = true)
++            return true
++        }
++        // A YouTube copy an earlier play left under `#alt` is read off disk
++        // ahead of any pin, and a partial one would be finished from the
++        // pinned file. Such a track stays YouTube's.
++        val alt = keyFactory.buildCacheKey(DataSpec(Uri.parse("bitchord://watch?v=$id")))
++        val youTubeOnDisk = runCatching {
++            cache.getCachedSpans(alt).isNotEmpty() &&
++                cache.getContentMetadata(alt).get(META_ORIGIN, null as String?) == Origin.YOUTUBE.name
++        }.getOrDefault(false)
++        if (youTubeOnDisk) {
++            TrackLog.d(TAG, "not pinning $id: a YouTube copy is already cached under $alt", about = id)
++            return false
++        }
++        val stream = runCatching { SourceResolver.prefetchSubstitute(target) }
++            .onFailure { TrackLog.d(TAG, "warm-up substitute failed for $id: ${it.message}", about = id) }
++            .getOrNull() ?: return false
++        // The pinned branch of the resolver has no manifest check (the race
++        // has); a pinned DASH/HLS URL fails the standby and drops the blend.
++        if (StreamContainer.isManifest(stream.url)) return false
++        if (StreamChoice.of(id) != null) return StreamChoice.isSubstitute(id)
++        StreamChoice.remember(id, stream, substituted = true)
++        return true
++    }
++
+     /**
+      * A queued track as read-ahead needs it.
+      *
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index d12b461..3a432d7 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -133,6 +133,7 @@ import com.music.bitchord.data.scrobbling.ListenBrainzManager
+ import com.music.bitchord.data.scrobbling.ScrobbleManager
+ import com.music.bitchord.data.settings.AppSettings
+ import com.music.bitchord.data.settings.EqualizerMode
++import com.music.bitchord.data.settings.ForkSettings
+ import com.music.bitchord.data.settings.OutputPcmMode
+ import com.music.bitchord.data.sources.SourceResolver
+ import com.music.bitchord.data.sources.SourceStream
+@@ -883,7 +884,12 @@ class PlaybackService : MediaLibraryService() {
+             if (isPlaying) registerCurrentPlay()
+             // Nothing to read ahead for while paused, and a pause is often
+             // the last thing that happens before the process goes idle.
+-            if (isPlaying) prefetchAround(exoPlayer) else cancelPrefetch()
++            // Fork: a user pause keeps read-ahead going; a stall still frees the bandwidth.
++            if (isPlaying) {
++                prefetchAround(exoPlayer)
++            } else if (exoPlayer.playWhenReady || !ForkSettings.prefetchWhilePaused.value) {
++                cancelPrefetch()
++            }
+             if (isPlaying) lookForBetterCopy(exoPlayer)
+             savePlaybackState(exoPlayer)
+             // Not strictly needed for the glyph — onPlayWhenReadyChanged has

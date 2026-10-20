@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: kavinned <142488487+kavinned@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 00:57:15 +0800
+Subject: [PATCH 06/16] feat(settings): add toggle for seamless source
+ crossfade defaulting to false
+
+(cherry picked from commit dc82057f5ca434b1390ff8200e1b710c430e081c)
+---
+ .../bitchord/data/settings/AppSettings.kt     | 10 ++++++++++
+ .../bitchord/ui/screens/SettingsSheet.kt      | 20 +++++++++++++++++++
+ app/src/main/res/values/strings.xml           |  2 ++
+ 3 files changed, 32 insertions(+)
+
+diff --git a/app/src/main/java/com/music/bitchord/data/settings/AppSettings.kt b/app/src/main/java/com/music/bitchord/data/settings/AppSettings.kt
+index 1de0096..980756c 100644
+--- a/app/src/main/java/com/music/bitchord/data/settings/AppSettings.kt
++++ b/app/src/main/java/com/music/bitchord/data/settings/AppSettings.kt
+@@ -399,6 +399,9 @@ object AppSettings {
+     /** Analyzes audio waveform/envelope to align matching playback moment between versions. */
+     val smartVersionAlignment = MutableStateFlow(true)
+ 
++    /** Enables micro-crossfade across dual players when swapping audio sources mid-playback. */
++    val sourceCrossfadeEnabled = MutableStateFlow(false)
++
+     /** Drops haze blur (status bar, mini player, bottom fade, lyrics focus) for a solid-fill look. */
+     val reduceDynamicBlur = MutableStateFlow(false)
+ 
+@@ -868,6 +871,7 @@ object AppSettings {
+         dontRepeatSuggestions.value = prefs.getBoolean(KEY_DONT_REPEAT_SUGGESTIONS, false)
+         preferMusicOnly.value = prefs.getBoolean(KEY_PREFER_MUSIC_ONLY, false)
+         smartVersionAlignment.value = prefs.getBoolean(KEY_SMART_VERSION_ALIGNMENT, true)
++        sourceCrossfadeEnabled.value = prefs.getBoolean(KEY_SOURCE_CROSSFADE, false)
+         reduceDynamicBlur.value = prefs.getBoolean(KEY_REDUCE_BLUR, false)
+         liquidGlass.value = prefs.getBoolean(KEY_LIQUID_GLASS, false)
+         lyricsBlur.value = prefs.getBoolean(KEY_LYRICS_BLUR, true)
+@@ -1273,6 +1277,11 @@ object AppSettings {
+         prefs.edit().putBoolean(KEY_SMART_VERSION_ALIGNMENT, value).apply()
+     }
+ 
++    fun setSourceCrossfadeEnabled(value: Boolean) {
++        sourceCrossfadeEnabled.value = value
++        prefs.edit().putBoolean(KEY_SOURCE_CROSSFADE, value).apply()
++    }
++
+     fun setReduceDynamicBlur(value: Boolean) {
+         reduceDynamicBlur.value = value
+         if (value) highPerformanceMode.value = false
+@@ -2030,6 +2039,7 @@ object AppSettings {
+     private const val KEY_DONT_REPEAT_SUGGESTIONS = "dont_repeat_suggestions"
+     private const val KEY_PREFER_MUSIC_ONLY = "prefer_music_only"
+     private const val KEY_SMART_VERSION_ALIGNMENT = "smart_version_alignment"
++    private const val KEY_SOURCE_CROSSFADE = "source_crossfade_enabled"
+     private const val KEY_REDUCE_BLUR = "reduce_dynamic_blur"
+     private const val KEY_LIQUID_GLASS = "liquid_glass"
+     private const val KEY_LYRICS_BLUR = "lyrics_blur"
+diff --git a/app/src/main/java/com/music/bitchord/ui/screens/SettingsSheet.kt b/app/src/main/java/com/music/bitchord/ui/screens/SettingsSheet.kt
+index f6b7107..a6488b5 100644
+--- a/app/src/main/java/com/music/bitchord/ui/screens/SettingsSheet.kt
++++ b/app/src/main/java/com/music/bitchord/ui/screens/SettingsSheet.kt
+@@ -247,6 +247,7 @@ fun SettingsScreen(
+     val dontRepeatSuggestions by AppSettings.dontRepeatSuggestions.collectAsStateWithLifecycle()
+     val preferMusicOnly by AppSettings.preferMusicOnly.collectAsStateWithLifecycle()
+     val smartVersionAlignment by AppSettings.smartVersionAlignment.collectAsStateWithLifecycle()
++    val sourceCrossfadeEnabled by AppSettings.sourceCrossfadeEnabled.collectAsStateWithLifecycle()
+     val filterNonMusicAudio by AppSettings.filterNonMusicAudio.collectAsStateWithLifecycle()
+     val localMusicFolderUri by AppSettings.localMusicFolderUri.collectAsStateWithLifecycle()
+     val highPerformanceMode by AppSettings.highPerformanceMode.collectAsStateWithLifecycle()
+@@ -574,6 +575,25 @@ fun SettingsScreen(
+                     onClick = { AppSettings.setPreferMusicOnly(!preferMusicOnly) },
+                 )
+             }
++            val sourceCrossfadeTitle = stringResource(R.string.source_crossfade)
++            row(sourceCrossfadeTitle, "crossfade", "source", "upgrade", "seamless") {
++                SettingsRow(
++                    icon = Icons.Rounded.Tune,
++                    title = sourceCrossfadeTitle,
++                    subtitle = stringResource(R.string.source_crossfade_subtitle),
++                    trailing = {
++                        Switch(
++                            checked = sourceCrossfadeEnabled,
++                            onCheckedChange = AppSettings::setSourceCrossfadeEnabled,
++                            colors = SwitchDefaults.colors(
++                                checkedTrackColor = MaterialTheme.colorScheme.primary,
++                                checkedBorderColor = MaterialTheme.colorScheme.primary,
++                            ),
++                        )
++                    },
++                    onClick = { AppSettings.setSourceCrossfadeEnabled(!sourceCrossfadeEnabled) },
++                )
++            }
+             val outputPrecisionTitle = stringResource(R.string.output_precision)
+             row(outputPrecisionTitle, "pcm", "bit depth", "sample rate", "dac") {
+                 SettingsRow(
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 4289042..31fecb5 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -268,6 +268,8 @@
+     <string name="prefer_music_only_subtitle">For music videos, show the video details while finding and loading the catalogue audio version</string>
+     <string name="smart_version_alignment">Smart audio alignment</string>
+     <string name="smart_version_alignment_subtitle">Analyze audio waveforms to match the exact corresponding playback moment</string>
++    <string name="source_crossfade" translatable="false">Seamless source crossfade</string>
++    <string name="source_crossfade_subtitle" translatable="false">Micro-crossfade across dual players when upgrading stream quality mid-playback</string>
+     <string name="equalizer">Equalizer</string>
+     <string name="equalizer_subtitle">Tone, seven bands and balance</string>
+     <string name="equalizer_footer">Shapes the sound inside BitChord, before it reaches the system.</string>

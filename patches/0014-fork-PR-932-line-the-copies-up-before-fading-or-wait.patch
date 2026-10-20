@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 10:55:55 +0300
+Subject: [PATCH 14/16] =?UTF-8?q?fork:=20PR=20932=20=E2=80=94=20line=20the?=
+ =?UTF-8?q?=20copies=20up=20before=20fading,=20or=20wait=20for=20the=20re-?=
+ =?UTF-8?q?offer?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ .../music/bitchord/playback/PlaybackService.kt  | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index 75d0b4b..2cd8ec4 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -4737,10 +4737,18 @@ class PlaybackService : MediaLibraryService() {
+                 awaitMoving()
+                 val lag = activePlayer.currentPosition - standbyPlayer.currentPosition
+                 TrackLog.d("BitChord", "upgrade crossfade: standby ${lag}ms behind before compensation", about = mediaId)
+-                if (lag in 15L until 300L) {
++                // Fork: lags up to a few seconds are compensated too (952ms was seen on a cold
++                // FLAC), and a fade only starts once the copies line up — the drift check in the
++                // fade below would otherwise abort it, and the re-offer would start over.
++                if (lag in 15L..3_000L) {
+                     standbyPlayer.seekTo(currentIndex, activePlayer.currentPosition + lag)
+                     awaitMoving()
+                 }
++                val residual = activePlayer.currentPosition - standbyPlayer.currentPosition
++                if (abs(residual) > 150L) {
++                    TrackLog.d("BitChord", "upgrade crossfade: standby still ${residual}ms off; waiting for the re-offer", about = mediaId)
++                    return false
++                }
+             } else {
+                 val seekTimeout = SystemClock.elapsedRealtime() + 400L
+                 while (coroutineContext.isActive && standbyPlayer.playbackState != Player.STATE_READY && SystemClock.elapsedRealtime() < seekTimeout) {
+@@ -4767,7 +4775,12 @@ class PlaybackService : MediaLibraryService() {
+ 
+                         // Check for user seeking / scrubbing during the crossfade
+                         if (abs(activePlayer.currentPosition - standbyPlayer.currentPosition) > 300L) {
+-                            TrackLog.d("BitChord", "user sought during upgrade crossfade; aborting swap", about = mediaId)
++                            TrackLog.d(
++                                "BitChord",
++                                "user sought during upgrade crossfade; aborting swap " +
++                                    "(active=${activePlayer.currentPosition} standby=${standbyPlayer.currentPosition})",
++                                about = mediaId,
++                            )
+                             return false
+                         }
+ 

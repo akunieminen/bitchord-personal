@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 10:27:17 +0300
+Subject: [PATCH 03/16] fix(cache): read-ahead checks the key it writes, so a
+ pinned substitute is cached past its 64kB probe
+
+---
+ .../com/music/bitchord/playback/AudioCache.kt | 39 ++++++++++++++++---
+ 1 file changed, 34 insertions(+), 5 deletions(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+index 04e0047..fcd175c 100644
+--- a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
++++ b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+@@ -7,6 +7,7 @@ import android.net.NetworkCapabilities
+ import android.net.Uri
+ import android.os.SystemClock
+ import com.music.bitchord.R
++import com.music.bitchord.data.Http
+ import com.music.bitchord.data.TrackLog
+ import com.music.bitchord.playback.smart.AutomixAnalysisSource
+ import androidx.media3.common.C
+@@ -44,6 +45,7 @@ import kotlinx.coroutines.flow.asStateFlow
+ import kotlinx.coroutines.job
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.withContext
++import okhttp3.Request
+ import java.io.File
+ import java.util.Locale
+ import java.util.concurrent.ConcurrentHashMap
+@@ -1417,8 +1419,12 @@ object AudioCache {
+ 
+     /** @return true once every range of [videoId] is on disk. */
+     private suspend fun cacheWholeOnce(videoId: String): Boolean {
+-        val total = runCatching { StreamResolver.contentLength(videoId) }.getOrNull()
+-            ?: return false
++        val total = if (StreamChoice.isSubstitute(videoId)) {
++            substituteLength(videoId)
++        } else {
++            runCatching { StreamResolver.contentLength(videoId) }.getOrNull()
++        } ?: return false
++        val key = readAheadKey(videoId)
+ 
+         var position = 0L
+         while (position < total) {
+@@ -1428,13 +1434,13 @@ object AudioCache {
+             // now" case the guard in [fetchWhole] exists for.
+             if (pendingQueue.firstOrNull() != videoId) return false
+             val length = minOf(CHUNK_BYTES, total - position)
+-            if (cache.getCachedBytes(videoId, position, length) < length) {
++            if (cache.getCachedBytes(key, position, length) < length) {
+                 fetch(videoId, position, length)
+                 // Written nowhere means the entry is held elsewhere; the rest
+                 // of this pass would be just as wasted. See [fetch] for why
+                 // this can be true even though the fetch just above returned
+                 // without error.
+-                if (cache.getCachedBytes(videoId, position, length) < length) return false
++                if (cache.getCachedBytes(key, position, length) < length) return false
+             }
+             position += length
+         }
+@@ -2144,7 +2150,30 @@ object AudioCache {
+      * from a track played earlier, or skipped back to — costs only the rest.
+      */
+     private suspend fun fetch(videoId: String, position: Long, length: Long) =
+-        fetch(videoId, Uri.parse("bitchord://watch?v=$videoId"), position, length)
++        fetch(readAheadKey(videoId), Uri.parse("bitchord://watch?v=$videoId"), position, length)
++
++    /**
++     * Fork: where read-ahead's writes for [videoId] actually land. Checking the
++     * plain id instead read a substitute's `#alt` entry as empty, so the lock
++     * probe "failed" after 64kB and nothing past it was ever cached.
++     */
++    private fun readAheadKey(videoId: String): String =
++        keyFactory.buildCacheKey(DataSpec(Uri.parse("bitchord://watch?v=$videoId")))
++
++    /** Fork: a pinned substitute's size, which YouTube's `clen` is not. Null when the host won't say. */
++    private suspend fun substituteLength(videoId: String): Long? = withContext(Dispatchers.IO) {
++        val stream = StreamChoice.of(videoId) ?: return@withContext null
++        val request = Request.Builder()
++            .url(stream.url)
++            .apply { stream.headers.forEach { (name, value) -> header(name, value) } }
++            .header("Range", "bytes=0-0")
++            .build()
++        runCatching {
++            Http.client.newCall(request).execute().use { response ->
++                response.header("Content-Range")?.substringAfterLast('/')?.toLongOrNull()
++            }
++        }.getOrNull()
++    }
+ 
+     /**
+      * [pinKey] forces the write to land under [cacheKey] instead of wherever

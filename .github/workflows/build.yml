@@ -1,0 +1,115 @@
+name: Build patched BitChord
+
+# Builds upstream's latest release with patches/*.patch applied, signs it with
+# the personal key, and publishes it here. The app's own updater reads this
+# repo's latest release, so the phone gets an "Update available" prompt.
+on:
+  schedule:
+    - cron: '23 */6 * * *'   # looks for a new upstream release; a no-op costs ~10s
+  push:
+    branches: [main]
+    paths: ['patches/**', '.github/workflows/build.yml']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Upstream tag to build (blank = latest release)
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: kushagrasinghx/BitChord
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+      build: ${{ steps.pick.outputs.build }}
+    steps:
+      - id: pick
+        env:
+          TAG_IN: ${{ inputs.tag }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          tag="${TAG_IN:-$(gh release view -R "$UPSTREAM" --json tagName -q .tagName)}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          # A schedule only builds a release not built yet; a push or a manual run always builds.
+          built=$(gh release list -R "$GITHUB_REPOSITORY" -L 100 --json tagName -q ".[].tagName" | grep -c "^$tag\." || true)
+          if [ "$EVENT" != schedule ] || [ "$built" = 0 ]; then echo "build=true" >> "$GITHUB_OUTPUT"; fi
+          echo "upstream $tag, built here $built time(s), event $EVENT"
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: kushagrasinghx/BitChord
+          ref: ${{ needs.check.outputs.tag }}
+          fetch-depth: 0   # git am --3way needs the blobs the patches were made against
+      - uses: actions/checkout@v4
+        with:
+          path: own
+
+      - name: Apply patches
+        run: |
+          git config user.name "bitchord-personal CI"
+          git config user.email "ci@users.noreply.github.com"
+          git am --3way own/patches/*.patch || {
+            echo "::error::A patch no longer applies to $TAG. Rebase the fork branch onto $TAG and re-export patches/."
+            git am --show-current-patch=diff | head -80
+            exit 1
+          }
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+          cache: gradle
+
+      - name: Signing config
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 -d > bitchord-release.jks
+          test -s bitchord-release.jks || { echo "::error::KEYSTORE_BASE64 secret missing"; exit 1; }
+          printf 'storeFile=bitchord-release.jks\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
+            "$KEYSTORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD" > keystore.properties
+          touch local.properties
+
+      - name: Build
+        run: |
+          chmod +x gradlew
+          ./gradlew --console=plain :app:assembleProdRelease \
+            -Pbitchord.forkRevision=${{ github.run_number }} -Pbitchord.bundleWear=false
+
+      - name: Publish
+        run: |
+          # Read back from the build, so the tag is exactly what the app reports.
+          version=$(jq -r '.elements[0].versionName' app/build/outputs/apk/prod/release/output-metadata.json)
+          # Only the arm64 split: the updater takes a universal APK first, and that one is 170 MB.
+          apk="BitChord-v${version}_arm64-v8a.apk"
+          cp app/build/outputs/apk/prod/release/app-prod-arm64-v8a-release.apk "$apk"
+          {
+            echo "Upstream $UPSTREAM $TAG ($(git rev-parse --short "$TAG")) plus:"
+            git log --format='- %s' "$TAG"..HEAD
+            echo
+            echo "---"
+            gh release view "$TAG" -R "$UPSTREAM" --json body -q .body || true
+          } > notes.md
+          gh release create "v$version" "$apk" -R "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --title "BitChord $version (personal)" --notes-file notes.md

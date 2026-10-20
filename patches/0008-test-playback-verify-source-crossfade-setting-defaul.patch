@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: kavinned <142488487+kavinned@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 00:57:37 +0800
+Subject: [PATCH 08/16] test(playback): verify source crossfade setting
+ defaults to false
+
+(cherry picked from commit b8c4f2df6b95b512a4aa027d5f965cfaac93f341)
+---
+ .../music/bitchord/SourceCrossfadeSettingsTest.kt   | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+ create mode 100644 app/src/test/java/com/music/bitchord/SourceCrossfadeSettingsTest.kt
+
+diff --git a/app/src/test/java/com/music/bitchord/SourceCrossfadeSettingsTest.kt b/app/src/test/java/com/music/bitchord/SourceCrossfadeSettingsTest.kt
+new file mode 100644
+index 0000000..d067e0b
+--- /dev/null
++++ b/app/src/test/java/com/music/bitchord/SourceCrossfadeSettingsTest.kt
+@@ -0,0 +1,13 @@
++package com.music.bitchord
++
++import com.music.bitchord.data.settings.AppSettings
++import org.junit.Assert.assertFalse
++import org.junit.Test
++
++class SourceCrossfadeSettingsTest {
++
++    @Test
++    fun `source crossfade defaults to false`() {
++        assertFalse(AppSettings.sourceCrossfadeEnabled.value)
++    }
++}

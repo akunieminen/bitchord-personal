@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 11:03:43 +0300
+Subject: [PATCH 16/16] fork: keep the matched tempo after a beat-matched mix
+ instead of snapping back
+
+---
+ .../music/bitchord/data/settings/ForkSettings.kt    |  5 ++++-
+ .../music/bitchord/playback/CrossfadeController.kt  | 13 ++++++++++++-
+ .../com/music/bitchord/playback/PlaybackService.kt  |  9 +++++----
+ .../music/bitchord/ui/screens/ForkTweaksGroup.kt    |  7 +++++++
+ 4 files changed, 28 insertions(+), 6 deletions(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/data/settings/ForkSettings.kt b/app/src/main/java/com/music/bitchord/data/settings/ForkSettings.kt
+index 1ca6785..513251a 100644
+--- a/app/src/main/java/com/music/bitchord/data/settings/ForkSettings.kt
++++ b/app/src/main/java/com/music/bitchord/data/settings/ForkSettings.kt
+@@ -41,6 +41,9 @@ object ForkSettings {
+     /** A track that arrived through a crossfade or Automix keeps its stream for that play. */
+     val noUpgradeAfterBlend = Toggle("no_upgrade_after_blend", true)
+ 
++    /** After a beat-matched mix the incoming track keeps the matched speed until it ends, instead of snapping back. */
++    val keepMixTempo = Toggle("keep_mix_tempo", true)
++
+     /**
+      * How long an unpinned track waits for a higher-ranked source before
+      * taking YouTube's stream. 0 is upstream's plain race.
+@@ -54,7 +57,7 @@ object ForkSettings {
+ 
+     fun init(context: Context) {
+         prefs = context.getSharedPreferences("bitchord_fork", Context.MODE_PRIVATE)
+-        listOf(addonLookahead, pinTwoAhead, fastReadAhead, prefetchWhilePaused, noUpgradeAfterBlend)
++        listOf(addonLookahead, pinTwoAhead, fastReadAhead, prefetchWhilePaused, noUpgradeAfterBlend, keepMixTempo)
+             .forEach { it.load() }
+         headStartMs.value = prefs.getLong(KEY_HEAD_START_MS, DEFAULT_HEAD_START_MS)
+     }
+diff --git a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
+index 045a987..4fa96cd 100644
+--- a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
++++ b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
+@@ -11,6 +11,7 @@ import androidx.media3.common.util.UnstableApi
+ import androidx.media3.exoplayer.ExoPlayer
+ import com.music.bitchord.data.listentogether.ListenTogether
+ import com.music.bitchord.data.settings.AppSettings
++import com.music.bitchord.data.settings.ForkSettings
+ import com.music.bitchord.data.settings.MixBlend
+ import com.music.bitchord.data.settings.SmartAnalysis
+ import com.music.bitchord.data.settings.TrackAnalysisState
+@@ -582,6 +583,9 @@ class CrossfadeController(
+      */
+     fun isTransitioning(): Boolean = phase != Phase.IDLE
+ 
++    /** Fork: an Advanced Automix ease-back is still walking a player's speed. */
++    fun isEasing(): Boolean = easing != null
++
+     /** Applies the listener's speed without exposing AudioTrack's parameter-change click. */
+     fun applyPlaybackSpeed(speed: Float) {
+         if (isTransitioning()) return
+@@ -624,6 +628,11 @@ class CrossfadeController(
+         }
+ 
+         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
++            // Fork: a tempo kept from the last mix ends with its track.
++            listeningTo?.takeIf { phase == Phase.IDLE && easing == null }?.let { player ->
++                val normal = AppSettings.playbackSpeed.value
++                if (abs(player.playbackParameters.speed - normal) >= SPEED_CHANGE_EPSILON) player.setPlaybackSpeed(normal)
++            }
+             when (reason) {
+                 // Something replaced the queue out from under the fade — a new
+                 // album, a new search result — so the tail still playing is a
+@@ -1863,7 +1872,9 @@ class CrossfadeController(
+                 // is the tempo lurch a DJ never lets anyone hear.
+                 // Repeated beat-by-beat ease steps caused a notch on every beat.
+                 // One short protected reset is less audible and cannot pump.
+-                setPlaybackSpeedClickless(it, AppSettings.playbackSpeed.value)
++                // Fork: or none at all — the reset was heard as a stop on a phone + Bluetooth
++                // speaker; the track keeps the matched tempo and is reset at its own end, below.
++                if (!ForkSettings.keepMixTempo.value) setPlaybackSpeedClickless(it, AppSettings.playbackSpeed.value)
+             }
+             outgoing?.let(::retire)
+         } else {
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index c572c65..8a5485b 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -4611,9 +4611,9 @@ class PlaybackService : MediaLibraryService() {
+         // Busy rather than unable: a version swap owns the standby, or an Advanced Automix
+         // tempo ease-back is still running. Neither share it nor hard-cut under it; the
+         // next progress tick re-offers the shelved stream.
+-        if (canCrossfade && (versionSwapJob?.isActive == true ||
+-                abs(activePlayer.playbackParameters.speed - AppSettings.playbackSpeed.value) > 0.001f)
+-        ) {
++        // Fork: asks the controller rather than comparing speeds — a tempo kept from a mix
++        // is not an ease, and treating it as one re-auditioned the upgrade every 5s.
++        if (canCrossfade && (versionSwapJob?.isActive == true || crossfade?.isEasing() == true)) {
+             QualityUpgrade.shelve(mediaId, stream)
+             return false
+         }
+@@ -4642,7 +4642,8 @@ class PlaybackService : MediaLibraryService() {
+             standbyPlayer.skipSilenceEnabled = activePlayer.skipSilenceEnabled
+             standbyPlayer.repeatMode = activePlayer.repeatMode
+             standbyPlayer.shuffleModeEnabled = activePlayer.shuffleModeEnabled
+-            standbyPlayer.setPlaybackSpeed(AppSettings.playbackSpeed.value)
++            // Fork: the active player's speed, which a kept mix tempo can make other than the setting.
++            standbyPlayer.setPlaybackSpeed(activePlayer.playbackParameters.speed)
+             standbyPlayer.volume = 0f
+             standbyPlayer.setMediaItems(newItems, currentIndex, livePos)
+             spareLoudness().track(mediaId, nextMediaIdOf(standbyPlayer))
+diff --git a/app/src/main/java/com/music/bitchord/ui/screens/ForkTweaksGroup.kt b/app/src/main/java/com/music/bitchord/ui/screens/ForkTweaksGroup.kt
+index 732d54b..3a36e88 100644
+--- a/app/src/main/java/com/music/bitchord/ui/screens/ForkTweaksGroup.kt
++++ b/app/src/main/java/com/music/bitchord/ui/screens/ForkTweaksGroup.kt
+@@ -59,6 +59,13 @@ internal fun ForkTweaksGroup() {
+             ForkSettings.noUpgradeAfterBlend,
+         )
+         RowDivider()
++        ToggleRow(
++            Icons.Rounded.Speed,
++            "Keep mix tempo",
++            "After a beat-matched Automix, the new song stays at the matched speed instead of snapping back",
++            ForkSettings.keepMixTempo,
++        )
++        RowDivider()
+         val headStart by ForkSettings.headStartMs.collectAsStateWithLifecycle()
+         SliderRow(
+             icon = Icons.Rounded.HourglassTop,

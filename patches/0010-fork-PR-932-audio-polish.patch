@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 10:22:46 +0300
+Subject: [PATCH 10/16] fork: PR 932 audio polish
+
+---
+ .../bitchord/playback/PlaybackService.kt      | 31 ++++++++++++++-----
+ 1 file changed, 24 insertions(+), 7 deletions(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index da907eb..75d0b4b 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -4721,6 +4721,26 @@ class PlaybackService : MediaLibraryService() {
+                     QualityUpgrade.shelve(mediaId, stream)
+                     return false
+                 }
++                // The resync seek resumes R ms late while the active player keeps going, so the
++                // standby would enter the fade R ms behind (a flam/echo). Measure R once its audio
++                // is moving, seek ahead by it once, and fade only when that audio is moving too.
++                // ponytail: assumes R repeats seek to seek; expect ±10-20ms left. The log is the knob.
++                suspend fun awaitMoving() {
++                    val from = standbyPlayer.currentPosition
++                    val by = SystemClock.elapsedRealtime() + 300L
++                    while (coroutineContext.isActive && standbyPlayer.currentPosition == from &&
++                        SystemClock.elapsedRealtime() < by
++                    ) {
++                        delay(5)
++                    }
++                }
++                awaitMoving()
++                val lag = activePlayer.currentPosition - standbyPlayer.currentPosition
++                TrackLog.d("BitChord", "upgrade crossfade: standby ${lag}ms behind before compensation", about = mediaId)
++                if (lag in 15L until 300L) {
++                    standbyPlayer.seekTo(currentIndex, activePlayer.currentPosition + lag)
++                    awaitMoving()
++                }
+             } else {
+                 val seekTimeout = SystemClock.elapsedRealtime() + 400L
+                 while (coroutineContext.isActive && standbyPlayer.playbackState != Player.STATE_READY && SystemClock.elapsedRealtime() < seekTimeout) {
+@@ -4755,13 +4775,10 @@ class PlaybackService : MediaLibraryService() {
+                             standbyPlayer.playWhenReady = activePlayer.playWhenReady
+                         }
+ 
+-                        val inGain = sin(progress * (PI / 2.0)).toFloat()
+-                        val outGain = cos(progress * (PI / 2.0)).toFloat()
+-                        standbyPlayer.volume = inGain
+-                        activePlayer.volume = outGain
+-                        val swapTrim = 1f / sqrt((inGain + outGain).coerceAtLeast(1f))
+-                        loudnessA.setBlendTrim(swapTrim)
+-                        loudnessB.setBlendTrim(swapTrim)
++                        // Two aligned copies of one master add in amplitude, so gains that sum
++                        // to 1 keep the level flat; equal-power swells ~+1.5dB mid-fade here.
++                        standbyPlayer.volume = progress
++                        activePlayer.volume = 1f - progress
+ 
+                         if (progress >= 1f) break
+                         delay(16)

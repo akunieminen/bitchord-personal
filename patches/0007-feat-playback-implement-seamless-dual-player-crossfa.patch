@@ -1,0 +1,358 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: kavinned <142488487+kavinned@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 00:57:29 +0800
+Subject: [PATCH 07/16] feat(playback): implement seamless dual-player
+ crossfade for source upgrades
+
+(cherry picked from commit 9c1dbb26de117b6211eb986c244415c20c1ba2c1)
+---
+ .../bitchord/playback/CrossfadeController.kt  |   8 +
+ .../bitchord/playback/PlaybackService.kt      | 249 ++++++++++++++++--
+ 2 files changed, 236 insertions(+), 21 deletions(-)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
+index ac33988..045a987 100644
+--- a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
++++ b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
+@@ -676,6 +676,14 @@ class CrossfadeController(
+         listeningTo = target
+     }
+ 
++    /**
++     * Rebinds the session listener to the active player after an external player
++     * swap (e.g. version swap or quality upgrade).
++     */
++    fun updateActivePlayer() {
++        listenTo(active())
++    }
++
+     fun start() {
+         listenTo(active())
+         tickerJob?.cancel()
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index bafb812..b89c7c4 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -178,6 +178,7 @@ import kotlin.math.roundToInt
+ import kotlin.random.Random
+ import kotlinx.coroutines.CancellationException
+ import kotlinx.coroutines.TimeoutCancellationException
++import kotlin.coroutines.coroutineContext
+ import java.util.Locale
+ import java.util.UUID
+ 
+@@ -1871,7 +1872,7 @@ class PlaybackService : MediaLibraryService() {
+                     }
+                 }
+             },
+-            versionSwapActive = { versionSwapJob?.isActive == true },
++            versionSwapActive = { versionSwapJob?.isActive == true || sourceSwapActive },
+         )
+ 
+     /**
+@@ -2017,6 +2018,7 @@ class PlaybackService : MediaLibraryService() {
+ 
+     private var versionSwapJob: Job? = null
+     private var versionSwapGeneration = 0
++    private var sourceSwapActive = false
+ 
+     /**
+      * Seamlessly transitions between two versions/sources of the same track
+@@ -2394,7 +2396,11 @@ class PlaybackService : MediaLibraryService() {
+         }
+     }
+ 
+-    private fun adoptPlayerForVersionSwap(outgoing: ExoPlayer, incoming: ExoPlayer) {
++    private fun adoptPlayerForVersionSwap(
++        outgoing: ExoPlayer,
++        incoming: ExoPlayer,
++        isSameTrack: Boolean = false,
++    ) {
+         setSessionOwner(outgoing, owns = false)
+         setSessionOwner(incoming, owns = true)
+ 
+@@ -2412,6 +2418,7 @@ class PlaybackService : MediaLibraryService() {
+         incoming.addAnalyticsListener(formatListener)
+ 
+         mediaSession?.player = newSessionPlayer(incoming, requireNotNull(crossfade))
++        crossfade?.updateActivePlayer()
+ 
+         incoming.volume = 1f
+         outgoing.stop()
+@@ -2421,12 +2428,19 @@ class PlaybackService : MediaLibraryService() {
+         swappingMediaId = null
+         refreshCustomLayouts()
+ 
+-        onTrackBecameCurrent(
+-            incoming.currentMediaItem,
+-            previousEnded = false,
+-            reason = Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED,
+-            alreadyAudible = true,
+-        )
++        if (isSameTrack) {
++            currentAudioInputFormat = null
++            activeTrackIsDolbyAtmos = NerdStats.declaredFormat(incoming.currentMediaItem?.mediaId)?.isDolbyAtmos == true
++            applySpatialAudioEnabled()
++            publishNerdStats()
++        } else {
++            onTrackBecameCurrent(
++                incoming.currentMediaItem,
++                previousEnded = false,
++                reason = Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED,
++                alreadyAudible = true,
++            )
++        }
+     }
+ 
+     /** Reopens the current song through YouTube and remembers that choice. */
+@@ -4545,6 +4559,200 @@ class PlaybackService : MediaLibraryService() {
+      * playback URI differs, so an item rebuilt identically would be accepted
+      * and quietly keep playing the old stream.
+      */
++
++    /**
++     * Seamlessly swaps the active playback stream to an upgraded rendition using the
++     * standby [spare] player and a smooth equal-power micro-crossfade (~300ms) with loudness
++     * trim compensation.
++     *
++     * Falls back to [Player.replaceMediaItem] on the active player if [spare] is unavailable,
++     * Automix is transitioning, or a Listen Together party is active.
++     *
++     * Returns true if the swap was performed, false if the track moved on or was aborted.
++     */
++    private suspend fun seamlessSwapToStream(
++        now: SwapPoint,
++        upgradedItem: MediaItem,
++        upgradedUri: String,
++        stream: SourceStream,
++    ): Boolean {
++        val mediaId = now.item.mediaId
++        val activePlayer = player ?: return false
++        val currentIndex = activePlayer.currentMediaItemIndex
++        if (currentIndex !in 0 until activePlayer.mediaItemCount) return false
++        if (activePlayer.currentMediaItem?.mediaId != mediaId) return false
++
++        val standbyPlayer = spare
++        val canCrossfade = standbyPlayer != null &&
++            AppSettings.sourceCrossfadeEnabled.value &&
++            (activePlayer.isPlaying || activePlayer.playbackState == Player.STATE_READY) &&
++            crossfade?.isTransitioning() != true &&
++            !ListenTogether.state.value.inParty
++
++        if (!canCrossfade || standbyPlayer == null) {
++            swappingMediaId = mediaId
++            swapCutAt = SystemClock.elapsedRealtime()
++            activePlayer.replaceMediaItem(currentIndex, upgradedItem)
++            activePlayer.seekTo(currentIndex, activePlayer.currentPosition)
++            activePlayer.prepare()
++            return true
++        }
++
++        sourceSwapActive = true
++        var adopted = false
++        try {
++            val newItems = (0 until activePlayer.mediaItemCount).map { i ->
++                if (i == currentIndex) upgradedItem else activePlayer.getMediaItemAt(i)
++            }
++            val wasPlaying = activePlayer.playWhenReady
++            val livePos = activePlayer.currentPosition
++
++            standbyPlayer.stop()
++            standbyPlayer.clearMediaItems()
++            standbyPlayer.skipSilenceEnabled = activePlayer.skipSilenceEnabled
++            standbyPlayer.repeatMode = activePlayer.repeatMode
++            standbyPlayer.shuffleModeEnabled = activePlayer.shuffleModeEnabled
++            standbyPlayer.setPlaybackSpeed(AppSettings.playbackSpeed.value)
++            standbyPlayer.volume = 0f
++            standbyPlayer.setMediaItems(newItems, currentIndex, livePos)
++            spareLoudness().track(mediaId, nextMediaIdOf(standbyPlayer))
++            standbyPlayer.playWhenReady = false
++            standbyPlayer.prepare()
++
++            val timeoutAt = SystemClock.elapsedRealtime() + 5_000L
++            var isReady = false
++            while (coroutineContext.isActive && SystemClock.elapsedRealtime() < timeoutAt) {
++                if (player !== activePlayer ||
++                    activePlayer.currentMediaItemIndex != currentIndex ||
++                    activePlayer.currentMediaItem?.mediaId != mediaId
++                ) {
++                    return false
++                }
++                if (crossfade?.isTransitioning() == true) {
++                    QualityUpgrade.shelve(mediaId, stream)
++                    TrackLog.d("BitChord", "upgrade for $mediaId shelved: a crossfade started")
++                    return false
++                }
++                if (standbyPlayer.playbackState == Player.STATE_READY) {
++                    isReady = true
++                    break
++                }
++                if (standbyPlayer.playbackState == Player.STATE_IDLE && standbyPlayer.playerError != null) {
++                    break
++                }
++                delay(20)
++            }
++
++            if (!isReady) {
++                TrackLog.w("BitChord", "upgrade standby player failed to prepare; aborting seamless swap to preserve current audio", about = mediaId)
++                QualityUpgrade.shelve(mediaId, stream)
++                return false
++            }
++
++            val willPlay = wasPlaying && activePlayer.playWhenReady
++            standbyPlayer.seekTo(currentIndex, activePlayer.currentPosition)
++
++            if (willPlay) {
++                standbyPlayer.play()
++                val runningTimeout = SystemClock.elapsedRealtime() + 600L
++                while (coroutineContext.isActive && !standbyPlayer.isPlaying && SystemClock.elapsedRealtime() < runningTimeout) {
++                    delay(10)
++                }
++                if (standbyPlayer.isPlaying) {
++                    standbyPlayer.seekTo(currentIndex, activePlayer.currentPosition)
++                    val resyncTimeout = SystemClock.elapsedRealtime() + 300L
++                    while (coroutineContext.isActive && standbyPlayer.playbackState != Player.STATE_READY && SystemClock.elapsedRealtime() < resyncTimeout) {
++                        delay(10)
++                    }
++                }
++                if (!standbyPlayer.isPlaying || standbyPlayer.playbackState != Player.STATE_READY) {
++                    TrackLog.w("BitChord", "standby player not producing audio before crossfade; aborting", about = mediaId)
++                    QualityUpgrade.shelve(mediaId, stream)
++                    return false
++                }
++            } else {
++                val seekTimeout = SystemClock.elapsedRealtime() + 400L
++                while (coroutineContext.isActive && standbyPlayer.playbackState != Player.STATE_READY && SystemClock.elapsedRealtime() < seekTimeout) {
++                    delay(10)
++                }
++                if (standbyPlayer.playbackState != Player.STATE_READY) {
++                    TrackLog.w("BitChord", "standby player not ready for paused swap; aborting", about = mediaId)
++                    QualityUpgrade.shelve(mediaId, stream)
++                    return false
++                }
++            }
++
++            swappingMediaId = mediaId
++
++            if (willPlay) {
++                val swapCrossfadeMs = 300L
++                val fadeStart = SystemClock.elapsedRealtime()
++                try {
++                    while (coroutineContext.isActive) {
++                        val elapsed = SystemClock.elapsedRealtime() - fadeStart
++                        val progress = (elapsed.toFloat() / swapCrossfadeMs).coerceIn(0f, 1f)
++
++                        if (player !== activePlayer ||
++                            activePlayer.currentMediaItemIndex != currentIndex ||
++                            activePlayer.currentMediaItem?.mediaId != mediaId
++                        ) {
++                            return false
++                        }
++
++                        // Check for user seeking / scrubbing during the crossfade
++                        if (abs(activePlayer.currentPosition - standbyPlayer.currentPosition) > 300L) {
++                            TrackLog.d("BitChord", "user sought during upgrade crossfade; aborting swap", about = mediaId)
++                            return false
++                        }
++
++                        if (standbyPlayer.playWhenReady != activePlayer.playWhenReady) {
++                            standbyPlayer.playWhenReady = activePlayer.playWhenReady
++                        }
++
++                        val inGain = sin(progress * (PI / 2.0)).toFloat()
++                        val outGain = cos(progress * (PI / 2.0)).toFloat()
++                        standbyPlayer.volume = inGain
++                        activePlayer.volume = outGain
++                        val swapTrim = 1f / sqrt((inGain + outGain).coerceAtLeast(1f))
++                        loudnessA.setBlendTrim(swapTrim)
++                        loudnessB.setBlendTrim(swapTrim)
++
++                        if (progress >= 1f) break
++                        delay(16)
++                    }
++
++                    adoptPlayerForVersionSwap(
++                        outgoing = activePlayer,
++                        incoming = standbyPlayer,
++                        isSameTrack = true,
++                    )
++                    adopted = true
++                } finally {
++                    loudnessA.setBlendTrim(1f)
++                    loudnessB.setBlendTrim(1f)
++                }
++            } else {
++                standbyPlayer.volume = 1f
++                adoptPlayerForVersionSwap(
++                    outgoing = activePlayer,
++                    incoming = standbyPlayer,
++                    isSameTrack = true,
++                )
++                adopted = true
++            }
++            return true
++        } finally {
++            if (!adopted) {
++                standbyPlayer.stop()
++                standbyPlayer.clearMediaItems()
++                standbyPlayer.volume = 1f
++                activePlayer.volume = 1f
++                swappingMediaId = null
++            }
++            sourceSwapActive = false
++        }
++    }
++
+     private suspend fun swapIn(mediaId: String, stream: SourceStream) {
+         val at = withContext(Dispatchers.Main) { swapPointFor(mediaId) } ?: return
+         if (at.duration > 0 && at.duration - at.position < UPGRADE_MIN_REMAINING_MS) {
+@@ -4698,27 +4906,25 @@ class PlaybackService : MediaLibraryService() {
+             // NerdStats cleanup for why the pre-upgrade claim has to be
+             // captured here rather than looked up again on revert.
+             val previousFormat = NerdStats.declaredFormat(mediaId)
+-            swappingMediaId = mediaId
+-            swapCutAt = SystemClock.elapsedRealtime()
+             val upgradedMetadata = now.item.mediaMetadata.buildUpon()
+                 .setExtras(Bundle(now.item.mediaMetadata.extras ?: Bundle()).apply {
+                     putBoolean(EXTRA_QUALITY_UPGRADED, true)
+                 })
+                 .build()
+-            player.replaceMediaItem(
+-                player.currentMediaItemIndex,
+-                now.item.buildUpon()
+-                    .setUri(upgradedUri)
+-                    .setMediaMetadata(upgradedMetadata)
+-                    .withResolvedStreamType(stream.url)
+-                    .build(),
+-            )
++            val upgradedItem = now.item.buildUpon()
++                .setUri(upgradedUri)
++                .setMediaMetadata(upgradedMetadata)
++                .withResolvedStreamType(stream.url)
++                .build()
++
++            val swapped = seamlessSwapToStream(now, upgradedItem, upgradedUri, stream)
++            if (!swapped) return@withContext
++
+             val upgradedSourceName = stream.sourceConfigId?.let { SourceRegistry.config(it)?.displayName }
+                 ?: "Upgrade"
+             NerdStats.onSourceStream(mediaId, stream.format, upgradedSourceName)
+             NerdStats.recordSource(mediaId, upgradedSourceName)
+-            player.seekTo(player.currentMediaItemIndex, now.position)
+-            player.prepare()
++            publishNerdStats()
+             QualityUpgrade.unshelve(mediaId)
+             TrackLog.d("BitChord", "upgraded to ${stream.format.summary} at ${now.position}ms ($upgradedSourceName)")
+             watchUpgrade(mediaId, now.uri, now.position, now.duration, previousFormat)
+@@ -4729,9 +4935,10 @@ class PlaybackService : MediaLibraryService() {
+                 // the second pass would see the first one as still active and
+                 // return without starting its lookup.
+                 val firstPass = upgradeJob
++                val activeP = this@PlaybackService.player ?: player
+                 scope.launch {
+                     firstPass?.join()
+-                    lookForBetterCopy(player)
++                    lookForBetterCopy(activeP)
+                 }
+             }
+             // The opening again, this time sized for Automix rather than for

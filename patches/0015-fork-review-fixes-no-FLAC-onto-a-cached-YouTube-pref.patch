@@ -1,0 +1,146 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: akunieminen <aku.nieminen1@gmail.com>
+Date: Tue, 20 Oct 2026 11:02:47 +0300
+Subject: [PATCH 15/16] =?UTF-8?q?fork:=20review=20fixes=20=E2=80=94=20no?=
+ =?UTF-8?q?=20FLAC=20onto=20a=20cached=20YouTube=20prefix,=20probe=20the?=
+ =?UTF-8?q?=20first=20missing=20byte,=20allow=20smooth=20swaps=20after=20a?=
+ =?UTF-8?q?=20blend,=20refused=20pins=20stay=20refused,=203-part=20version?=
+ =?UTF-8?q?=20before=20the=20fork=20revision?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ app/build.gradle.kts                          |  8 +++--
+ .../com/music/bitchord/playback/AudioCache.kt | 35 ++++++++++++-------
+ .../bitchord/playback/PlaybackService.kt      |  9 +++--
+ 3 files changed, 34 insertions(+), 18 deletions(-)
+
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index ca30684..c47df50 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -69,8 +69,12 @@ android {
+         targetSdk = 36
+         versionCode = rootProject.extra["bitchordVersionCode"] as Int
+         // Fork: CI appends its build number (1.8.1 -> 1.8.1.7) so the in-app updater sees each fork build as newer.
+-        versionName = (rootProject.extra["bitchordVersionName"] as String) +
+-            (findProperty("bitchord.forkRevision")?.let { ".$it" } ?: "")
++        // Padded to three parts first (1.9 -> 1.9.0.45), or 1.9.1.46 would compare older than 1.9.45.
++        versionName = (rootProject.extra["bitchordVersionName"] as String).let { base ->
++            findProperty("bitchord.forkRevision")?.let { rev ->
++                (base.split('.') + listOf("0", "0")).take(3).joinToString(".") + ".$rev"
++            } ?: base
++        }
+ 
+         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+ 
+diff --git a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+index fcd175c..063c28f 100644
+--- a/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
++++ b/app/src/main/java/com/music/bitchord/playback/AudioCache.kt
+@@ -1331,6 +1331,8 @@ object AudioCache {
+      * give StreamChoice a putIfAbsent if a flip ever shows in the log.
+      */
+     private suspend fun pinSubstitute(id: String, target: TrackMatcher.Target): Boolean {
++        // A substitute that just failed in the player stays refused; re-pinning it reads ~50MB for nothing.
++        if (StreamChoice.substitutesRefused(id)) return false
+         StreamChoice.of(id)?.let { pinned ->
+             if (!StreamChoice.isSubstitute(id)) return false
+             // Re-stamped, so a pin made a track early doesn't age out before
+@@ -1341,15 +1343,10 @@ object AudioCache {
+             return true
+         }
+         // A YouTube copy an earlier play left under `#alt` is read off disk
+-        // ahead of any pin, and a partial one would be finished from the
+-        // pinned file. Such a track stays YouTube's.
+-        val alt = keyFactory.buildCacheKey(DataSpec(Uri.parse("bitchord://watch?v=$id")))
+-        val youTubeOnDisk = runCatching {
+-            cache.getCachedSpans(alt).isNotEmpty() &&
+-                cache.getContentMetadata(alt).get(META_ORIGIN, null as String?) == Origin.YOUTUBE.name
+-        }.getOrDefault(false)
+-        if (youTubeOnDisk) {
+-            TrackLog.d(TAG, "not pinning $id: a YouTube copy is already cached under $alt", about = id)
++        // ahead of any pin, and the resolver finishes it from YouTube (see
++        // [holdsYouTubeBytes]). Such a track stays YouTube's.
++        if (holdsYouTubeBytes(DataSpec(Uri.parse("bitchord://watch?v=$id")))) {
++            TrackLog.d(TAG, "not pinning $id: a YouTube copy is already cached under #alt", about = id)
+             return false
+         }
+         val stream = runCatching { SourceResolver.prefetchSubstitute(target) }
+@@ -1363,6 +1360,13 @@ object AudioCache {
+         return true
+     }
+ 
++    /** Fork: whether the entry [spec] reads already holds YouTube bytes; finishing it from another file splices two containers. */
++    fun holdsYouTubeBytes(spec: DataSpec): Boolean = ::cache.isInitialized && runCatching {
++        val key = spec.key ?: keyFactory.buildCacheKey(spec)
++        cache.getCachedSpans(key).isNotEmpty() &&
++            cache.getContentMetadata(key).get(META_ORIGIN, null as String?) == Origin.YOUTUBE.name
++    }.getOrDefault(false)
++
+     /**
+      * A queued track as read-ahead needs it.
+      *
+@@ -2196,6 +2200,11 @@ object AudioCache {
+     ) {
+         if (upstreamFactory == null) return
+         if (cache.getCachedBytes(cacheKey, position, length) >= length) return
++        // Fork: knock at the first byte not on disk. A probe over a cached head
++        // "lands" without the network, and the pull behind it reads a locked hole into nowhere.
++        val head = cache.getCachedLength(cacheKey, position, length).coerceAtLeast(0)
++        val from = position + head
++        val rest = length - head
+ 
+         // A cheap first knock rather than the whole range on the door.
+         // Losing this entry to another writer isn't something
+@@ -2211,11 +2220,11 @@ object AudioCache {
+         // time. A small probe reaches the same verdict for a fraction of
+         // the cost, and only a probe that actually lands is worth following
+         // with the rest of the range.
+-        if (length > LOCK_PROBE_BYTES) {
+-            pull(cacheKey, uri, position, LOCK_PROBE_BYTES, pinKey)
+-            if (cache.getCachedBytes(cacheKey, position, LOCK_PROBE_BYTES) < LOCK_PROBE_BYTES) return
++        if (rest > LOCK_PROBE_BYTES) {
++            pull(cacheKey, uri, from, LOCK_PROBE_BYTES, pinKey)
++            if (cache.getCachedBytes(cacheKey, from, LOCK_PROBE_BYTES) < LOCK_PROBE_BYTES) return
+         }
+-        pull(cacheKey, uri, position, length, pinKey)
++        pull(cacheKey, uri, from, rest, pinKey)
+     }
+ 
+     /** The actual network pull behind [fetch], unconditional and unchecked. */
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index 2cd8ec4..c572c65 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -1508,7 +1508,9 @@ class PlaybackService : MediaLibraryService() {
+             // the end of the cached bytes. Deciding afresh each time is how
+             // the middle of an MP4 ended up appended to a WebM. See
+             // [StreamChoice].
+-            StreamChoice.of(videoId)?.let { serving ->
++            // Fork: an entry already holding YouTube bytes is finished from YouTube, pinned or not.
++            val youTubeOnDisk = AudioCache.holdsYouTubeBytes(dataSpec)
++            StreamChoice.of(videoId)?.takeUnless { youTubeOnDisk && StreamChoice.isSubstitute(videoId) }?.let { serving ->
+                 // What the stream claims to be, restated on every open rather
+                 // than only on the one that chose it.
+                 //
+@@ -1564,7 +1566,7 @@ class PlaybackService : MediaLibraryService() {
+             // [raceYouTubeOrModule]. Only worth the extra lookup when
+             // something actually outranks YouTube; otherwise this is the
+             // plain resolve every build before this one made.
+-            if (!SourceResolver.canSubstituteForYouTube()) {
++            if (!SourceResolver.canSubstituteForYouTube() || youTubeOnDisk) {
+                 val streamUrl = try {
+                     runBlocking(about) {
+                         withTimeout(RESOLVE_TIMEOUT_MS) { StreamResolver.resolve(videoId) }
+@@ -4301,7 +4303,8 @@ class PlaybackService : MediaLibraryService() {
+         val alreadyPending = QualityUpgrade.isPending(mediaId)
+         val shelved = QualityUpgrade.shelvedFor(mediaId)
+         if (shelved == null && !alreadyPending && !QualityUpgrade.couldStillUpgrade(mediaId, uri)) return
+-        if (ForkSettings.noUpgradeAfterBlend.value && mediaId == blendedIn) {
++        // With the smooth upgrade swap on there is no cut to protect the mix from.
++        if (ForkSettings.noUpgradeAfterBlend.value && !AppSettings.sourceCrossfadeEnabled.value && mediaId == blendedIn) {
+             NerdStats.onLosslessRaceEnd(mediaId)
+             return
+         }
